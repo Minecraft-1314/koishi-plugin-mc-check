@@ -1,2 +1,9 @@
 name: AI 绘图
-description: 支持文生图、图生图、多API轮询/顺序调用、自动拉取模型、分辨率预设、重试与限流
+description: 支持文生图、图生图、多API轮询/负载均衡、自动提示词、限流与超时控制
+commands:
+  draw:
+    description: 文生图
+    usage: 输入提示词即可生成图片
+  imgdraw:
+    description: 图生图
+    usage: 输入提示词后发送图片即可生成
