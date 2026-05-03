@@ -1,9 +1,63 @@
-name: AI 绘图
-description: 支持文生图、图生图、多API轮询/负载均衡、自动提示词、限流与超时控制
 commands:
-  draw:
-    description: 文生图
-    usage: 输入提示词即可生成图片
-  imgdraw:
-    description: 图生图
-    usage: 输入提示词后发送图片即可生成
+  mc-check:
+    description: 查询 Minecraft 服务器状态
+    options:
+      type: 服务器类型 (java / bedrock)
+  mc-bind:
+    description: 将当前群绑定到指定服务器
+  mc-unbind:
+    description: 解绑服务器
+  mc-pin:
+    description: 置顶服务器
+  mc-unpin:
+    description: 取消置顶
+  mc-global-set:
+    description: 管理全局服务器 (管理员)
+  mc-skin:
+    description: 查看正版玩家皮肤
+  mc-ysskin:
+    description: 查看 LittleSkin 外置登录皮肤
+  mc-update:
+    description: 查看版本更新
+
+config:
+  debug: 开启调试日志（输出全部请求与响应数据）
+  globalServers: 全局默认服务器地址列表
+  globalServerType: 全局默认服务器类型
+  enableGroupIsolation: 启用后各群可单独绑定服务器
+  requestTimeout: API 请求超时 (毫秒)
+  enableAutoUpdatePush: 开启版本更新自动推送
+  autoUpdateTime: 版本更新推送时间 (HH:mm)
+  enableBedrockFallback: Java 服务器离线时自动尝试 Bedrock 查询
+  enableCardImage: 查询单个服务器时自动生成精美卡片图片 (需 Puppeteer)
+  messages:
+    mcCheckNoServer: 无服务器提示
+    mcCheckNoGlobal: 无全局服务器提示
+    mcCheckTimeout: 查询超时提示
+    mcBindSuccess: 绑定成功（{0} 为地址）
+    mcBindGroupOnly: 仅群聊可用提示
+    mcBindDisabled: 分群功能关闭提示
+    mcBindDuplicate: 重复绑定提示
+    mcUnbindSuccess: 解绑全部成功
+    mcUnbindSuccessOne: 解绑指定成功（{0} 为地址）
+    mcUnbindNoBind: 未找到绑定提示
+    mcUnbindGroupOnly: 解绑仅群聊提示
+    mcUnbindDisabled: 解绑分群关闭提示
+    mcUpdateNoUpdate: 无更新提示
+    mcUpdateRelease: 正式版更新标题
+    mcUpdateSnapshot: 快照版更新标题
+    mcUpdateError: 版本检查失败提示
+    pinSuccess: 置顶成功
+    unpinSuccess: 取消置顶成功
+    globalSetAdd: 添加全局服务器成功
+    globalSetRemove: 移除全局服务器成功
+    globalSetList: 全局服务器列表
+    skinNotFound: 皮肤未找到提示
+    skinTitle: 皮肤标题
+    databaseRequired: 缺少数据库提示
+    puppeteerRequired: 缺少 Puppeteer 提示
+    ysSkinBindHint: 外置登录绑定提示
+    ysSkinBindSuccess: 外置登录绑定成功
+    ysSkinNoBind: 未绑定外置登录
+    ysSkinNoRoles: 外置登录无角色提示
+    ysSkinRoleNotFound: 外置登录角色未找到
