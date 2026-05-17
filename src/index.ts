@@ -71,11 +71,18 @@ interface McGGlobalServer {
   type: 'java' | 'bedrock'
 }
 
+interface McPluginConfig {
+  id: number
+  key: string
+  value: string
+}
+
 declare module 'koishi' {
   interface Tables {
     mc_guild_servers: McGuildServer
     mc_version_cache: McVersionCache
     mc_global_servers: McGGlobalServer
+    mc_plugin_config: McPluginConfig
   }
 }
 
@@ -176,7 +183,48 @@ export function apply(ctx: Context, config: McCheckConfig) {
   let fontBase64 = ''
   let bgBase64 = ''
 
+  ctx.model.extend('mc_plugin_config', {
+    id: 'unsigned',
+    key: 'string',
+    value: 'string',
+  }, {
+    primary: 'id',
+    autoInc: true,
+    unique: ['key'],
+  })
+
+  async function getConfigValue(key: string, defaultValue: string): Promise<string> {
+    try {
+      const rows = await ctx.database.get('mc_plugin_config', { key })
+      if (rows.length) return rows[0].value
+    } catch {}
+    return defaultValue
+  }
+
+  async function setConfigValue(key: string, value: string): Promise<void> {
+    try {
+      const existing = await ctx.database.get('mc_plugin_config', { key })
+      if (existing.length) {
+        await ctx.database.set('mc_plugin_config', { key }, { value })
+      } else {
+        await ctx.database.create('mc_plugin_config', { key, value })
+      }
+    } catch {}
+  }
+
+  async function getEnableCardImage(): Promise<boolean> {
+    const raw = await getConfigValue('enableCardImage', String(config.enableCardImage))
+    const currentConfig = String(config.enableCardImage)
+    if (raw !== currentConfig) {
+      await setConfigValue('enableCardImage', currentConfig)
+      return config.enableCardImage
+    }
+    return raw === 'true'
+  }
+
   ctx.on('ready', async () => {
+    await getEnableCardImage()
+
     if (puppeteer) {
       const pluginRoot = __dirname
       const sourceDir = path.resolve(pluginRoot, '../source')
@@ -437,18 +485,17 @@ export function apply(ctx: Context, config: McCheckConfig) {
         return results.join('\n\n')
       }
 
-      let target = address
       const type: 'java' | 'bedrock' = (options?.type === 'bedrock' ? 'bedrock' : config.globalServerType) as 'java' | 'bedrock'
-      if (config.enableGroupIsolation && !address && session?.guildId) {
-        const bound = await ctx.database.get('mc_guild_servers', { guildId: session.guildId })
-        if (bound.length) target = bound[0].serverAddress
-      }
-      const status = await fetchWithFallback(target, type)
-      if (config.enableCardImage && puppeteer) {
-        const img = await renderStatusCard(status, target)
+      const status = await fetchWithFallback(address, type)
+
+      const useCardImage = await getEnableCardImage()
+      if (useCardImage) {
+        if (!puppeteer) return t('puppeteerRequired')
+        const img = await renderStatusCard(status, address)
         if (img) return h.image(img, 'image/jpeg')
+        return formatStatus(status, address)
       }
-      return formatStatus(status, target)
+      return formatStatus(status, address)
     })
 
   ctx.command('mc-bind <address:text>', '绑定服务器')
@@ -503,7 +550,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
       debugLog(`[mc-global-set] 操作: ${action} ${value || ''}`)
       if (!session || ((session as any).authority ?? 0) < 2) return
       if (action === 'add' && value) {
-        const type = session.content?.includes('-t bedrock') ? 'bedrock' : 'java'
+        const type = value.includes('-t bedrock') ? 'bedrock' : 'java'
         await ctx.database.create('mc_global_servers', { address: value, type })
         return t('globalSetAdd', value)
       }
