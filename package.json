@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-mc-check",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "Koishi Minecraft 服务插件，支持服务器状态查询、正版皮肤预览、版本更新推送与精美卡片生成",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",

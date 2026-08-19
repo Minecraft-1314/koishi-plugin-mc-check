@@ -3,6 +3,7 @@ import axios from 'axios'
 import path from 'node:path'
 import fs from 'node:fs'
 import net from 'node:net'
+import dgram from 'node:dgram'
 
 export const inject = {
   required: ['database'],
@@ -100,6 +101,320 @@ function tcpPing(host: string, port: number): Promise<number | null> {
   })
 }
 
+function encodeVarInt(value: number): Buffer {
+  const bytes: number[] = []
+  let v = value
+  do {
+    let temp = v & 0x7F
+    v >>>= 7
+    if (v !== 0) temp |= 0x80
+    bytes.push(temp)
+  } while (v !== 0)
+  return Buffer.from(bytes)
+}
+
+function decodeVarInt(buffer: Buffer, offset: number = 0): { value: number; length: number } {
+  let value = 0
+  let position = 0
+  let currentByte: number
+  let i = offset
+  do {
+    currentByte = buffer[i]
+    value |= (currentByte & 0x7F) << (position * 7)
+    position++
+    if (position > 5) throw new Error('VarInt too big')
+    i++
+  } while ((currentByte & 0x80) !== 0)
+  return { value, length: i - offset }
+}
+
+function createHandshakePacket(host: string, port: number, protocolVersion: number = 47): Buffer {
+  const hostBuf = Buffer.from(host, 'utf-8')
+  const portBuf = Buffer.alloc(2)
+  portBuf.writeUInt16BE(port, 0)
+
+  const packetId = Buffer.from([0x00])
+  const protocolVersionBuf = encodeVarInt(protocolVersion)
+  const hostLengthBuf = encodeVarInt(hostBuf.length)
+  const nextStateBuf = Buffer.from([0x01])
+
+  const payload = Buffer.concat([
+    packetId,
+    protocolVersionBuf,
+    hostLengthBuf,
+    hostBuf,
+    portBuf,
+    nextStateBuf,
+  ])
+
+  const length = encodeVarInt(payload.length)
+  return Buffer.concat([length, payload])
+}
+
+function createStatusRequestPacket(): Buffer {
+  const packetId = Buffer.from([0x00])
+  const length = encodeVarInt(packetId.length)
+  return Buffer.concat([length, packetId])
+}
+
+function readVarIntFromSocket(socket: net.Socket): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let buffer = Buffer.alloc(0)
+    const onData = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk])
+      try {
+        const { value, length } = decodeVarInt(buffer, 0)
+        if (length > 0 && buffer.length >= length) {
+          socket.removeListener('data', onData)
+          resolve(value)
+        }
+      } catch {
+        // continue receiving
+      }
+    }
+    socket.on('data', onData)
+    socket.on('error', reject)
+    socket.on('timeout', () => reject(new Error('timeout')))
+  })
+}
+
+function readPacket(socket: net.Socket): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    let buffer = Buffer.alloc(0)
+    const onData = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk])
+      try {
+        const { value: packetLength, length: varIntLength } = decodeVarInt(buffer, 0)
+        if (packetLength > 0 && buffer.length >= varIntLength + packetLength) {
+          const packet = buffer.slice(varIntLength, varIntLength + packetLength)
+          socket.removeListener('data', onData)
+          resolve(packet)
+        }
+      } catch {
+        // continue receiving
+      }
+    }
+    socket.on('data', onData)
+    socket.on('error', reject)
+    socket.on('timeout', () => reject(new Error('timeout')))
+  })
+}
+
+function extractMotd(description: any): string {
+  if (!description) return ''
+  if (typeof description === 'string') return description
+  if (typeof description === 'object') {
+    if (description.text) return description.text
+    if (description.extra) {
+      return description.extra.map((part: any) => extractMotd(part)).join('')
+    }
+    if (description.translate) return description.translate
+  }
+  return ''
+}
+
+function createBedrockPingPacket(): Buffer {
+  const magic = Buffer.from([0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34, 0x56, 0x78])
+  const clientGuid = Buffer.alloc(8)
+  const timestamp = Buffer.alloc(8)
+  const packet = Buffer.concat([
+    Buffer.from([0x01]),
+    timestamp,
+    magic,
+    clientGuid,
+  ])
+  return packet
+}
+
+function parseBedrockPong(buffer: Buffer): any {
+  if (buffer[0] !== 0x1c) throw new Error('Invalid pong packet')
+  let offset = 1
+  offset += 8
+  offset += 16
+  offset += 8
+
+  const readString = () => {
+    const len = buffer.readUInt16BE(offset)
+    offset += 2
+    const str = buffer.slice(offset, offset + len).toString('utf-8')
+    offset += len
+    return str
+  }
+
+  const serverName = readString()
+  const protocolVersion = buffer[offset]
+  offset += 1
+  const version = readString()
+  const onlinePlayers = buffer.readUInt32BE(offset)
+  offset += 4
+  const maxPlayers = buffer.readUInt32BE(offset)
+  offset += 4
+  const motd = readString()
+  const gameMode = readString()
+  const gameModeId = buffer.readUInt32BE(offset)
+  offset += 4
+  const portIpv4 = buffer.readUInt16BE(offset)
+  offset += 2
+  const portIpv6 = buffer.readUInt16BE(offset)
+  offset += 2
+
+  return {
+    serverName,
+    protocolVersion,
+    version,
+    onlinePlayers,
+    maxPlayers,
+    motd,
+    gameMode,
+  }
+}
+
+async function fetchJavaServerStatus(host: string, port: number): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket()
+    const timeout = 5000
+    const startTime = Date.now()
+    let settled = false
+
+    socket.setTimeout(timeout)
+    socket.on('timeout', () => {
+      if (!settled) {
+        settled = true
+        socket.destroy()
+        reject(new Error('timeout'))
+      }
+    })
+    socket.on('error', (err) => {
+      if (!settled) {
+        settled = true
+        socket.destroy()
+        reject(err)
+      }
+    })
+
+    socket.connect(port, host, async () => {
+      try {
+        const handshake = createHandshakePacket(host, port)
+        const statusRequest = createStatusRequestPacket()
+        socket.write(handshake)
+        socket.write(statusRequest)
+
+        const packet = await readPacket(socket)
+        const packetId = packet[0]
+        if (packetId !== 0x00) throw new Error('Invalid packet ID')
+
+        const jsonStr = packet.slice(1).toString('utf-8')
+        const data = JSON.parse(jsonStr)
+
+        const latency = Date.now() - startTime
+        socket.destroy()
+
+        const version = data.version?.name || data.version || '未知'
+        const motd = extractMotd(data.description)
+        const playersOnline = data.players?.online ?? 0
+        const playersMax = data.players?.max ?? 0
+        const playerList = data.players?.sample?.map((p: any) => p.name) || []
+        const icon = data.favicon || null
+
+        resolve({
+          online: true,
+          host,
+          port,
+          version: { name_raw: version },
+          motd: { clean: motd },
+          players: {
+            online: playersOnline,
+            max: playersMax,
+            list: playerList,
+          },
+          ping: latency,
+          icon,
+          software: null,
+          plugins: [],
+          mods: [],
+          error: null,
+        })
+      } catch (err: any) {
+        socket.destroy()
+        if (!settled) {
+          settled = true
+          reject(err)
+        }
+      }
+    })
+  })
+}
+
+async function fetchBedrockServerStatus(host: string, port: number): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const socket = dgram.createSocket('udp4')
+    const startTime = Date.now()
+    let settled = false
+
+    const timeout = 5000
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true
+        socket.close()
+        reject(new Error('timeout'))
+      }
+    }, timeout)
+
+    socket.on('message', (msg) => {
+      if (!settled) {
+        settled = true
+        clearTimeout(timer)
+        socket.close()
+        try {
+          const data = parseBedrockPong(msg)
+          const latency = Date.now() - startTime
+          resolve({
+            online: true,
+            host,
+            port,
+            version: { name_raw: data.version || '未知' },
+            motd: { clean: data.motd || data.serverName || '' },
+            players: {
+              online: data.onlinePlayers,
+              max: data.maxPlayers,
+              list: [],
+            },
+            ping: latency,
+            icon: null,
+            software: data.gameMode || null,
+            plugins: [],
+            mods: [],
+            error: null,
+          })
+        } catch (err: any) {
+          reject(err)
+        }
+      }
+    })
+
+    socket.on('error', (err) => {
+      if (!settled) {
+        settled = true
+        clearTimeout(timer)
+        socket.close()
+        reject(err)
+      }
+    })
+
+    try {
+      const packet = createBedrockPingPacket()
+      socket.send(packet, port, host)
+    } catch (err) {
+      if (!settled) {
+        settled = true
+        clearTimeout(timer)
+        socket.close()
+        reject(err)
+      }
+    }
+  })
+}
+
 export const Config: Schema<McCheckConfig> = Schema.object({
   debug: Schema.boolean().description('开启调试日志（输出全部请求与响应数据）').default(false),
   globalServers: Schema.array(Schema.string().role('url')).description('全局默认服务器地址列表').default([]),
@@ -185,6 +500,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
   }
 
   let cardImageEnabled = config.enableCardImage
+
   ctx.on('ready', async () => {
     const raw = await getConfigValue('enableCardImage', String(config.enableCardImage))
     if (raw !== String(config.enableCardImage)) {
@@ -262,46 +578,29 @@ export function apply(ctx: Context, config: McCheckConfig) {
   async function fetchServerStatus(host: string, type: 'java' | 'bedrock'): Promise<any> {
     const defaultPort = type === 'bedrock' ? 19132 : 25565
     const { host: h, port } = parseHostPort(host, defaultPort)
-    const query = port === defaultPort ? h : `${h}:${port}`
-    const endpoint = type === 'bedrock'
-      ? `https://api.mcsrvstat.us/bedrock/3/${encodeURIComponent(query)}`
-      : `https://api.mcsrvstat.us/3/${encodeURIComponent(query)}`
-    debugLog(`[mc-check] 请求服务器状态: ${endpoint}`)
+    const targetPort = port || defaultPort
+
     try {
-      const { data } = await axios.get(endpoint, {
-        timeout: config.requestTimeout,
-        headers: { 'User-Agent': 'KoishiMCPlugin/2.0' },
-      })
-      if (config.debug) {
-        logger.info(`[mc-check] 响应数据:\n${JSON.stringify(data, null, 2)}`)
+      if (type === 'java') {
+        return await fetchJavaServerStatus(h, targetPort)
+      } else {
+        return await fetchBedrockServerStatus(h, targetPort)
       }
-      let latency: number | null = null
-      if (data.online) {
-        const targetHost = data.hostname || data.ip || h
-        const targetPort = data.port || port || 25565
-        latency = await tcpPing(targetHost, targetPort)
-      }
+    } catch (err: any) {
       return {
-        online: data.online,
+        online: false,
         host: h,
-        port: port,
-        version: { name_raw: data.version || '未知' },
-        motd: { clean: Array.isArray(data.motd?.clean) ? data.motd.clean.join(' | ') : (data.motd?.clean || (data.motd?.raw ? data.motd.raw.join(' ') : '')) },
-        players: {
-          online: data.players?.online ?? 0,
-          max: data.players?.max ?? 0,
-          list: data.players?.list || [],
-        },
-        ping: latency,
-        icon: data.icon || null,
-        software: data.software || null,
-        plugins: data.plugins || [],
-        mods: data.mods || [],
-        error: null,
+        port: targetPort,
+        version: null,
+        motd: null,
+        players: null,
+        ping: null,
+        icon: null,
+        software: null,
+        plugins: [],
+        mods: [],
+        error: err.message || String(err),
       }
-    } catch (e: any) {
-      debugLog(`[mc-check] 请求失败: ${e.message}`)
-      return { online: false, error: e.message }
     }
   }
 
@@ -314,14 +613,14 @@ export function apply(ctx: Context, config: McCheckConfig) {
     return result
   }
 
-  async function formatStatus(status: any, label: string): Promise<string> {
+  function formatStatus(status: any, label: string): string {
     if (!status.online) return `❌ ${escapeHtml(label)} - 离线${status.error ? ` (${escapeHtml(status.error)})` : ''}`
 
     const motd = status.motd?.clean || ''
     const players = status.players
     const playerStr = players ? `${players.online}/${players.max}` : '?/?'
     const playerList = players?.online && players.list?.length
-      ? `\n  在线: ${players.list.map((p: any) => p.name || p.name_clean || '未知玩家').join(', ')}`
+      ? `\n  在线: ${players.list.map((p: any) => p.name || p).join(', ')}`
       : ''
     const pingStr = status.ping !== null ? `  📶 ${status.ping}ms` : ''
     const software = status.software ? `\n⚙️ 服务端: ${status.software}` : ''
@@ -388,7 +687,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
   }
 
   function getGlobalServers(): Array<{ address: string; type: 'java' | 'bedrock' }> {
-    return config.globalServers.map(s => ({ address: s, type: config.globalServerType }))
+    return config.globalServers.map((s: string) => ({ address: s, type: config.globalServerType }))
   }
 
   async function renderStatusCard(status: any, label: string): Promise<Buffer | null> {
@@ -429,18 +728,18 @@ export function apply(ctx: Context, config: McCheckConfig) {
 
   ctx.command('mc-check [address:text]', '查询 Minecraft 服务器状态')
     .option('type', '-t <type:string>')
-    .action(async ({ session, options }, address) => {
+    .action(async ({ session, options }: any, address: string | undefined) => {
       debugLog(`[mc-check] 指令触发，参数: address=${address}, type=${options?.type}`)
       const requestedType: 'java' | 'bedrock' = (options?.type as 'java' | 'bedrock') || config.globalServerType
       if (!address) {
         const targets = getGlobalServers()
         if (!targets.length) return t('mcCheckNoGlobal')
-        debugLog(`[mc-check] 批量查询目标: ${JSON.stringify(targets.map(t => t.address))}`)
+        debugLog(`[mc-check] 批量查询目标: ${JSON.stringify(targets.map((t: any) => t.address))}`)
         const CONCURRENCY = 5
         const results: string[] = []
         for (let i = 0; i < targets.length; i += CONCURRENCY) {
           const batch = targets.slice(i, i + CONCURRENCY)
-          const batchResults = await Promise.all(batch.map(async target => {
+          const batchResults = await Promise.all(batch.map(async (target: any) => {
             const status = await fetchWithFallback(target.address, target.type)
             return formatStatus(status, target.address)
           }))
@@ -460,7 +759,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
     })
 
   ctx.command('mc-skin <player:text>', '查看正版玩家皮肤')
-    .action(async ({ session }, player) => {
+    .action(async ({ session }: any, player: string | undefined) => {
       debugLog(`[mc-skin] 查询皮肤: ${player}`)
       if (!player) return t('skinNotFound')
       const buffer = await fetchSkin(player)
@@ -469,7 +768,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
     })
 
   ctx.command('mc-update', '查看版本更新')
-    .action(async ({ session }) => {
+    .action(async ({ session }: any) => {
       debugLog('[mc-update] 检查版本')
       try {
         const versionInfo = await fetchVersionInfo()

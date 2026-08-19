@@ -3,22 +3,22 @@
 ## 项目介绍 (Project Introduction)
 
 ### 中文
-这是一个为 Koishi 机器人框架开发的 **Minecraft 综合服务插件**，使用免费公共 API，支持服务器状态查询、正版皮肤预览、版本更新推送及精美卡片生成。核心特性：
-- 服务器状态查询：在线状态、版本、玩家列表、MOTD、软件信息及本地 TCP 延迟测试
-- 正版皮肤预览：输入正版玩家名即可获取全身皮肤
-- 版本更新推送：插件启动即缓存最新的正式版/快照版信息，手动或自动检查更新
+这是一个为 Koishi 机器人框架开发的 **Minecraft 综合服务插件**，服务器状态查询采用原生协议实现（不依赖任何第三方 API），同时支持正版皮肤预览、版本更新推送及精美卡片生成。核心特性：
+- 服务器状态查询：原生 Java Server List Ping / Bedrock RakNet Ping，获取在线状态、版本、玩家列表、MOTD，延迟直接本地测量
+- 正版皮肤预览：输入正版玩家名即可获取全身皮肤（使用 Mojang 官方 API）
+- 版本更新推送：插件启动即缓存最新的正式版/快照版信息，手动或自动检查更新（使用 Mojang 官方 API）
 - 精美状态卡片（需 Puppeteer）：暗色主题卡片，展示图标、在线率、MOTD、延迟等
 - 所有提示文本均可在配置页面自定义
-- 内置 Debug 模式，可详细记录 API 请求/响应及操作日志
+- 内置 Debug 模式，可详细记录操作日志
 
 ### English
-A comprehensive Minecraft plugin for the Koishi bot framework, using free public APIs to query server status, preview vanilla skins, push version updates, and generate beautiful status cards. Key features:
-- Server status query: online status, version, player list, MOTD, software info and local TCP ping
-- Vanilla skin preview: Full-body skin from a username
-- Version update push: caches latest release/snapshot on startup, manual or scheduled checks
+A comprehensive Minecraft plugin for the Koishi bot framework, using native server list ping protocols for server status (no third-party APIs), previewing vanilla skins, pushing version updates, and generating beautiful status cards. Key features:
+- Server status query: native Java Server List Ping / Bedrock RakNet Ping, online status, version, player list, MOTD, local latency measurement
+- Vanilla skin preview: Full-body skin from a username (via Mojang official API)
+- Version update push: caches latest release/snapshot on startup, manual or scheduled checks (via Mojang official API)
 - Beautiful Status Cards (requires Puppeteer): dark-themed card with icon, player rate, MOTD, ping
 - All reply texts customizable via config
-- Debug mode for detailed API interaction logs
+- Debug mode for detailed logs
 
 ## 项目仓库 (Repository)
 - GitHub: `https://github.com/Minecraft-1314/koishi-plugin-mc-check`
@@ -36,10 +36,10 @@ A comprehensive Minecraft plugin for the Koishi bot framework, using free public
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `debug` | boolean | false | 是否开启调试日志（详细输出所有请求/响应） |
+| `debug` | boolean | false | 是否开启调试日志（详细输出操作日志） |
 | `globalServers` | string[] | [] | 全局默认服务器地址列表 |
 | `globalServerType` | 'java'\|'bedrock' | 'java' | 全局默认服务器类型 |
-| `requestTimeout` | number | 5000 | API 请求超时（毫秒） |
+| `requestTimeout` | number | 5000 | HTTP 请求超时（毫秒），用于皮肤和版本 API |
 | `enableAutoUpdatePush` | boolean | false | 开启版本更新自动推送 |
 | `autoUpdateTime` | string | "09:00" | 版本更新推送时间（HH:mm） |
 | `enableBedrockFallback` | boolean | true | Java 服务器离线时自动尝试 Bedrock 查询 |
@@ -66,24 +66,30 @@ A comprehensive Minecraft plugin for the Koishi bot framework, using free public
 - **Koishi 数据库插件**：需安装并启用任意数据库插件（如 `database-sqlite`），用于存储版本缓存。
 - **Puppeteer 服务**（可选）：若需使用状态卡片图片生成，请安装 `koishi-plugin-puppeteer`；未安装时插件会自动降级为文本输出。
 
-## 使用的 API (APIs Used)
-所有 API 均为免费公共接口，无需注册或密钥：
+## 使用的协议与 API (Protocols & APIs)
 
+### 服务器状态查询（原生协议，无第三方依赖）
+| 类型 | 协议 | 说明 |
+|------|------|------|
+| Java 版 | Server List Ping (1.7+) | 直接 TCP 连接，发送握手和状态请求包，解析 JSON 响应，获取 MOTD、版本、玩家列表、图标等 |
+| Bedrock 版 | RakNet Unconnected Ping | 使用 UDP 发送 Ping 包，解析 Pong 响应，获取服务器名称、MOTD、玩家数、游戏模式等 |
+
+延迟测量直接在协议交互过程中计算，无需额外请求。
+
+### 其他功能使用的官方 API
 | 功能 | API | 说明 |
 |------|-----|------|
-| 服务器状态 | `api.mcsrvstat.us` | Java/Bedrock 双协议，返回在线状态、版本、玩家列表、MOTD 等 |
-| 延迟测试 | 本地 TCP Ping | 直接连接服务器端口获取真实延迟（毫秒） |
 | 玩家 UUID | `api.mojang.com` | 正版玩家名 → UUID |
-| 皮肤渲染 | `visage.surgeplay.com` | 正版 3D 全身皮肤渲染 |
+| 皮肤渲染 | `visage.surgeplay.com` | 正版 3D 全身皮肤渲染（Mojang 官方皮肤服务） |
 | 版本清单 | `piston-meta.mojang.com` | Mojang 官方版本信息（release + snapshot） |
 
 ## 功能特性
-- 完善的服务器状态查询，支持 Java / Bedrock 协议及离线自动回退
-- 本地 TCP Ping 测量延迟，精准稳定
+- 服务器状态查询完全离线化，不依赖第三方 API，数据更实时，延迟更低
+- 支持 Java 和 Bedrock 双协议，Java 离线时可自动回退 Bedrock 查询
 - 正版皮肤预览
 - 版本更新智能缓存，启动时获取，对比变化，避免重复请求
 - 所有提示文本均可通过配置界面自定义
-- 详细的 Debug 日志，便于排查网络与 API 问题
+- 详细的 Debug 日志，便于排查网络与协议问题
 - 卡片渲染失败时自动降级为文本，保证功能可用性
 
 ## 项目贡献者 (Contributors)
@@ -92,7 +98,6 @@ A comprehensive Minecraft plugin for the Koishi bot framework, using free public
 |----------------------|-------------------------|
 | Minecraft-1314 | 插件完整开发 |
 | koishi-shangxue-apps | UI 背景图灵感与卡片排版风格参考 |
-| api.mcsrvstat.us | 免费 Minecraft 服务器状态查询 API |
 | Mojang (api.mojang.com) | 玩家名 → UUID 查询 |
 | visage.surgeplay.com | 皮肤 3D 渲染服务 |
 | piston-meta.mojang.com | Minecraft 官方版本清单 API |
