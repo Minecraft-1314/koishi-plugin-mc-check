@@ -59,6 +59,7 @@ A comprehensive Minecraft plugin for the Koishi bot framework, using free public
 | `mcUpdateError` | `获取版本信息失败` | 版本检查失败提示 |
 | `skinNotFound` | `未找到该玩家` | 皮肤未找到提示 |
 | `skinTitle` | `{0} 的皮肤` | 皮肤标题 |
+| `mcCheckInvalidType` | `无效的服务器类型，仅支持 java 或 bedrock` | 无效服务器类型提示 |
 | `databaseRequired` | `本功能需要安装数据库插件（如 database-sqlite）。` | 缺少数据库提示 |
 | `puppeteerRequired` | `需要安装并启用 puppeteer 服务才能使用此功能。` | 缺少 Puppeteer 提示 |
 

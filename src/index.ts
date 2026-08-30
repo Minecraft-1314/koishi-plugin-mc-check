@@ -1,8 +1,9 @@
 import { Context, Schema, h } from 'koishi'
-import axios from 'axios'
-import path from 'node:path'
 import fs from 'node:fs'
-import net from 'node:net'
+import path from 'node:path'
+import { renderStatusCard } from './card'
+import type { ServerAssets, ServerStatus, ServerTarget, VersionInfo } from './types'
+import { formatStatus, parseHostPort, parseTime, tcpPing } from './utils'
 
 export const inject = {
   required: ['database'],
@@ -30,6 +31,7 @@ interface McCheckConfig {
     skinTitle: string
     databaseRequired: string
     puppeteerRequired: string
+    mcCheckInvalidType: string
   }
 }
 
@@ -40,65 +42,13 @@ interface McVersionCache {
   updatedAt: Date
 }
 
-interface McPluginConfig {
-  id: number
-  key: string
-  value: string
-}
-
 declare module 'koishi' {
   interface Tables {
     mc_version_cache: McVersionCache
-    mc_plugin_config: McPluginConfig
   }
 }
 
-function parseHostPort(raw: string, defaultPort: number): { host: string; port: number } {
-  const match = raw.match(/^(.+):(\d{1,5})$/)
-  if (match) {
-    const port = parseInt(match[2], 10)
-    if (port >= 1 && port <= 65535) return { host: match[1], port }
-  }
-  return { host: raw, port: defaultPort }
-}
-
-function parseTime(timeStr: string): { hour: number; minute: number } {
-  const [h, m] = timeStr.split(':').map(Number)
-  return { hour: h, minute: m }
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}
-
-const timePattern = /^([01]?\d|2[0-4]):([0-5]\d)$/
-
-function tcpPing(host: string, port: number): Promise<number | null> {
-  return new Promise((resolve) => {
-    const start = Date.now()
-    const socket = new net.Socket()
-    socket.setTimeout(3000)
-    socket.on('connect', () => {
-      const ping = Date.now() - start
-      socket.destroy()
-      resolve(ping)
-    })
-    socket.on('error', () => {
-      socket.destroy()
-      resolve(null)
-    })
-    socket.on('timeout', () => {
-      socket.destroy()
-      resolve(null)
-    })
-    socket.connect(port, host)
-  })
-}
+const timePattern = /^([01]?\d|2[0-3]):([0-5]\d)$/
 
 export const Config: Schema<McCheckConfig> = Schema.object({
   debug: Schema.boolean().description('开启调试日志（输出全部请求与响应数据）').default(false),
@@ -121,136 +71,15 @@ export const Config: Schema<McCheckConfig> = Schema.object({
     skinTitle: Schema.string().description('皮肤标题').default('{0} 的皮肤'),
     databaseRequired: Schema.string().description('缺少数据库提示').default('本功能需要安装数据库插件（如 database-sqlite）。'),
     puppeteerRequired: Schema.string().description('缺少 Puppeteer 提示').default('需要安装并启用 puppeteer 服务才能使用此功能。'),
+    mcCheckInvalidType: Schema.string().description('无效服务器类型提示').default('无效的服务器类型，仅支持 java 或 bedrock'),
   }).description('自定义回复文本'),
 }).description('Minecraft 服务器状态插件')
-
-async function toBase64(filePath: string): Promise<string> {
-  try {
-    const buffer = await fs.promises.readFile(filePath)
-    const ext = path.extname(filePath).toLowerCase()
-    let mime = 'application/octet-stream'
-    if (ext === '.png') mime = 'image/png'
-    else if (ext === '.jpg' || ext === '.jpeg') mime = 'image/jpeg'
-    else if (ext === '.otf') mime = 'font/otf'
-    else if (ext === '.ttf') mime = 'font/ttf'
-    return `data:${mime};base64,${buffer.toString('base64')}`
-  } catch {
-    return ''
-  }
-}
 
 export function apply(ctx: Context, config: McCheckConfig) {
   const logger = ctx.logger('mc-check')
 
-  function getPuppeteer(): any {
-    try {
-      const svc = (ctx as any).puppeteer
-      if (svc) return svc
-      return (ctx as any).get?.('puppeteer')
-    } catch {
-      return undefined
-    }
-  }
-
-  let fontBase64 = ''
-  let bgBase64 = ''
-
-  ctx.model.extend('mc_plugin_config', {
-    id: 'unsigned',
-    key: 'string',
-    value: 'string',
-  }, {
-    primary: 'id',
-    autoInc: true,
-    unique: ['key'],
-  })
-
-  async function getConfigValue(key: string, defaultValue: string): Promise<string> {
-    try {
-      const rows = await ctx.database.get('mc_plugin_config', { key })
-      if (rows.length) return rows[0].value
-    } catch {}
-    return defaultValue
-  }
-
-  async function setConfigValue(key: string, value: string): Promise<void> {
-    try {
-      const existing = await ctx.database.get('mc_plugin_config', { key })
-      if (existing.length) {
-        await ctx.database.set('mc_plugin_config', { key }, { value })
-      } else {
-        await ctx.database.create('mc_plugin_config', { key, value })
-      }
-    } catch {}
-  }
-
-  let cardImageEnabled = config.enableCardImage
-
-  ctx.on('ready', async () => {
-    const raw = await getConfigValue('enableCardImage', String(config.enableCardImage))
-    if (raw !== String(config.enableCardImage)) {
-      await setConfigValue('enableCardImage', String(config.enableCardImage))
-      cardImageEnabled = config.enableCardImage
-    } else {
-      cardImageEnabled = raw === 'true'
-    }
-
-    const puppeteer = getPuppeteer()
-    if (puppeteer) {
-      const pluginRoot = __dirname
-      const sourceDir = path.resolve(pluginRoot, '../source')
-      const fontPath = path.resolve(sourceDir, '荆南麦圆体.otf')
-      const bgPath = path.resolve(sourceDir, 'qzbknd.png')
-      if (fs.existsSync(fontPath)) fontBase64 = await toBase64(fontPath)
-      if (fs.existsSync(bgPath)) bgBase64 = await toBase64(bgPath)
-    }
-
-    try {
-      const response = await axios.get('https://piston-meta.mojang.com/mc/game/version_manifest.json', { timeout: 10000 })
-      const { latest, versions } = response.data
-      if (latest && versions) {
-        const release = versions.find((v: any) => v.id === latest.release)
-        const snapshot = versions.find((v: any) => v.id === latest.snapshot)
-        if (release && snapshot) {
-          const existing = await ctx.database.get('mc_version_cache', {})
-          if (existing.length) {
-            await ctx.database.set('mc_version_cache', { id: existing[0].id }, {
-              releaseId: release.id,
-              snapshotId: snapshot.id,
-              updatedAt: new Date(),
-            })
-          } else {
-            await ctx.database.create('mc_version_cache', {
-              releaseId: release.id,
-              snapshotId: snapshot.id,
-            })
-          }
-          if (config.debug) logger.info(`[mc-update] 启动时缓存版本: release=${release.id}, snapshot=${snapshot.id}`)
-        }
-      }
-    } catch (e: any) {
-      if (config.debug) logger.info(`[mc-update] 启动获取版本失败: ${e.message}`)
-    }
-  })
-
   function debugLog(msg: string) {
     if (config.debug) logger.info(msg)
-  }
-
-  ctx.i18n.define('zh', {
-    commands: {
-      'mc-check': { description: '查询服务器状态' },
-      'mc-update': { description: '查看版本更新' },
-      'mc-skin': { description: '查看正版玩家皮肤' },
-    },
-  })
-
-  function t(key: keyof McCheckConfig['messages'], ...args: any[]): string {
-    let tmpl = config.messages[key] || key
-    for (let i = 0; i < args.length; i++) {
-      tmpl = tmpl.split(`{${i}}`).join(args[i])
-    }
-    return tmpl
   }
 
   ctx.model.extend('mc_version_cache', {
@@ -260,53 +89,85 @@ export function apply(ctx: Context, config: McCheckConfig) {
     updatedAt: 'timestamp',
   }, { primary: 'id', autoInc: true })
 
-  async function fetchServerStatus(host: string, type: 'java' | 'bedrock'): Promise<any> {
+  function getPuppeteer(): any {
+    return (ctx as any).puppeteer || (ctx as any).get?.('puppeteer')
+  }
+
+  ctx.i18n.define('zh', {
+    commands: {
+      'mc-check': { description: '查询 Minecraft 服务器状态' },
+      'mc-update': { description: '查看版本更新' },
+      'mc-skin': { description: '查看正版玩家皮肤' },
+    },
+  })
+
+  function t(key: keyof McCheckConfig['messages'], ...args: any[]): string {
+    let tmpl = config.messages[key] || key
+    for (let i = 0; i < args.length; i++) {
+      tmpl = tmpl.split(`{${i}}`).join(String(args[i]))
+    }
+    return tmpl
+  }
+
+  async function fetchServerStatus(host: string, type: 'java' | 'bedrock'): Promise<ServerStatus> {
     const defaultPort = type === 'bedrock' ? 19132 : 25565
-    const { host: h, port } = parseHostPort(host, defaultPort)
-    const query = port === defaultPort ? h : `${h}:${port}`
+    const { host: address, port } = parseHostPort(host, defaultPort)
+    const query = port === defaultPort ? address : `${address}:${port}`
     const endpoint = type === 'bedrock'
       ? `https://api.mcsrvstat.us/bedrock/3/${encodeURIComponent(query)}`
       : `https://api.mcsrvstat.us/3/${encodeURIComponent(query)}`
     debugLog(`[mc-check] 请求服务器状态: ${endpoint}`)
     try {
-      const { data } = await axios.get(endpoint, {
+      const data = await ctx.http.get(endpoint, {
         timeout: config.requestTimeout,
         headers: { 'User-Agent': 'KoishiMCPlugin/2.0' },
       })
       if (config.debug) {
         logger.info(`[mc-check] 响应数据:\n${JSON.stringify(data, null, 2)}`)
       }
-      let latency: number | null = null
-      if (data.online) {
-        const targetHost = data.hostname || data.ip || h
-        const targetPort = data.port || port || 25565
-        latency = await tcpPing(targetHost, targetPort)
+      const online = Boolean(data.online)
+      let ping: number | null = null
+      if (online) {
+        ping = await tcpPing(data.hostname || data.ip || address, Number(data.port) || port)
       }
+      const motdRaw = data.motd || {}
+      const motd = Array.isArray(motdRaw.clean)
+        ? motdRaw.clean.join(' | ')
+        : (motdRaw.clean || (Array.isArray(motdRaw.raw) ? motdRaw.raw.join(' ') : ''))
       return {
-        online: data.online,
-        host: h,
-        port: port,
-        version: { name_raw: data.version || '未知' },
-        motd: { clean: Array.isArray(data.motd?.clean) ? data.motd.clean.join(' | ') : (data.motd?.clean || (data.motd?.raw ? data.motd.raw.join(' ') : '')) },
+        online,
+        host: address,
+        port,
+        version: typeof data.version === 'string' ? data.version : (data.version?.name || '未知'),
+        motd,
         players: {
           online: data.players?.online ?? 0,
           max: data.players?.max ?? 0,
           list: data.players?.list || [],
         },
-        ping: latency,
+        ping,
         icon: data.icon || null,
-        software: data.software || null,
-        plugins: data.plugins || [],
-        mods: data.mods || [],
+        software: typeof data.software === 'string' ? data.software : (data.software?.name || null),
         error: null,
       }
-    } catch (e: any) {
-      debugLog(`[mc-check] 请求失败: ${e.message}`)
-      return { online: false, error: e.message }
+    } catch (error: any) {
+      debugLog(`[mc-check] 请求失败: ${error.message}`)
+      return {
+        online: false,
+        host,
+        port: defaultPort,
+        version: '',
+        motd: '',
+        players: { online: 0, max: 0, list: [] },
+        ping: null,
+        icon: null,
+        software: null,
+        error: error.message,
+      }
     }
   }
 
-  async function fetchWithFallback(host: string, type: 'java' | 'bedrock'): Promise<any> {
+  async function fetchWithFallback(host: string, type: 'java' | 'bedrock'): Promise<ServerStatus> {
     const result = await fetchServerStatus(host, type)
     if (!result.online && type === 'java' && config.enableBedrockFallback) {
       debugLog(`[mc-check] Java 离线，尝试 Bedrock 查询: ${host}`)
@@ -315,42 +176,28 @@ export function apply(ctx: Context, config: McCheckConfig) {
     return result
   }
 
-  function formatStatus(status: any, label: string): string {
-    if (!status.online) return `❌ ${escapeHtml(label)} - 离线${status.error ? ` (${escapeHtml(status.error)})` : ''}`
-
-    const motd = status.motd?.clean || ''
-    const players = status.players
-    const playerStr = players ? `${players.online}/${players.max}` : '?/?'
-    const playerList = players?.online && players.list?.length
-      ? `\n  在线: ${players.list.map((p: any) => p.name || p.name_clean || '未知玩家').join(', ')}`
-      : ''
-    const pingStr = status.ping !== null ? `  📶 ${status.ping}ms` : ''
-    const software = status.software ? `\n⚙️ 服务端: ${status.software}` : ''
-
-    return [
-      `🟢 ${escapeHtml(label)}:${status.port || 25565}${pingStr}`,
-      `📋 版本: ${status.version?.name_raw || status.version || '未知'}`,
-      `👥 玩家: ${playerStr}${playerList}`,
-      motd ? `💬 MOTD: ${motd}` : '',
-      software,
-    ].filter(Boolean).join('\n')
-  }
-
-  const uuidCache = new Map<string, string | null>()
+  const uuidCache = new Map<string, { value: string | null; time: number }>()
+  const UUID_TTL = 60 * 60 * 1000
+  const UUID_MAX = 200
 
   async function fetchUuid(username: string): Promise<string | null> {
-    if (uuidCache.has(username)) return uuidCache.get(username)!
-    const url = `https://api.mojang.com/users/profiles/minecraft/${username}`
+    const now = Date.now()
+    const hit = uuidCache.get(username)
+    if (hit && now - hit.time < UUID_TTL) return hit.value
+    const url = `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`
     debugLog(`[mc-skin] 请求 UUID: ${url}`)
     try {
-      const { data } = await axios.get(url, { timeout: 5000 })
+      const data = await ctx.http.get(url, { timeout: 5000 })
       if (config.debug) logger.info(`[mc-skin] UUID 响应: ${JSON.stringify(data)}`)
-      const result = data?.id || null
-      uuidCache.set(username, result)
-      return result
-    } catch (e: any) {
-      debugLog(`[mc-skin] UUID 请求失败: ${e.message}`)
-      uuidCache.set(username, null)
+      const value: string | null = data?.id || null
+      if (uuidCache.size >= UUID_MAX) {
+        const first = uuidCache.keys().next().value
+        if (first) uuidCache.delete(first)
+      }
+      uuidCache.set(username, { value, time: now })
+      return value
+    } catch (error: any) {
+      debugLog(`[mc-skin] UUID 请求失败: ${error.message}`)
       return null
     }
   }
@@ -360,108 +207,125 @@ export function apply(ctx: Context, config: McCheckConfig) {
     if (!uuid) return null
     const url = `https://visage.surgeplay.com/full/512/${uuid}`
     try {
-      const response = await axios.get(url, {
+      const buffer = await ctx.http.get(url, {
         responseType: 'arraybuffer',
         timeout: 10000,
         headers: {
-          'User-Agent': 'KoishiMCPlugin/2.0 (+https://github.com/Minecraft-1314/koishi-plugin-mc-check)'
-        }
+          'User-Agent': 'KoishiMCPlugin/2.0 (+https://github.com/Minecraft-1314/koishi-plugin-mc-check)',
+        },
       })
-      return Buffer.from(response.data)
-    } catch (e: any) {
-      debugLog(`[mc-skin] 皮肤下载失败: ${e.message}`)
+      return Buffer.from(buffer as ArrayBuffer)
+    } catch (error: any) {
+      debugLog(`[mc-skin] 皮肤下载失败: ${error.message}`)
       return null
     }
   }
 
-  async function fetchVersionInfo(): Promise<{ release: any; snapshot: any } | null> {
+  async function fetchVersionInfo(): Promise<VersionInfo | null> {
     try {
-      const response = await axios.get('https://piston-meta.mojang.com/mc/game/version_manifest.json', { timeout: 10000 })
-      const { latest, versions } = response.data
+      const data = await ctx.http.get('https://piston-meta.mojang.com/mc/game/version_manifest.json', { timeout: 10000 })
+      const { latest, versions } = data
       if (!latest || !versions) return null
       const release = versions.find((v: any) => v.id === latest.release)
       const snapshot = versions.find((v: any) => v.id === latest.snapshot)
       if (!release || !snapshot) return null
       return { release, snapshot }
-    } catch {
+    } catch (error: any) {
+      debugLog(`[mc-update] 获取版本清单失败: ${error.message}`)
       return null
     }
   }
 
-  function getGlobalServers(): Array<{ address: string; type: 'java' | 'bedrock' }> {
-    return config.globalServers.map((s: string) => ({ address: s, type: config.globalServerType }))
-  }
-
-  async function renderStatusCard(status: any, label: string): Promise<Buffer | null> {
-    const puppeteer = getPuppeteer()
-    if (!puppeteer) return null
-
-    const online: boolean = status.online
-    const hostDisplay = escapeHtml(label)
-    const version = escapeHtml(status.version?.name_raw || status.version || '未知')
-    const players = status.players
-    const playerOnline = players?.online ?? 0
-    const playerMax = players?.max ?? 0
-    const motdText = escapeHtml(status.motd?.clean || '')
-    const ping = status.ping !== null ? status.ping : 0
-    const software = escapeHtml(status.software || '')
-    const icon = status.icon
-    const iconHtml = icon ? `<img src="${icon}" style="width:64px;height:64px;border-radius:8px;margin-right:16px;">` : ''
-    const onlineColor = online ? '#4CAF50' : '#F44336'
-
-    const fontFace = fontBase64 ? `@font-face { font-family: 'MinecraftFont'; src: url('${fontBase64}'); }` : ''
-    const fontFamily = fontBase64 ? "'MinecraftFont', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif" : "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif"
-    const bgStyle = bgBase64 ? `background-image: url('${bgBase64}'); background-size: cover; background-position: center;` : 'background: #1e1e1e;'
-
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>${fontFace}body{margin:0;padding:30px;font-family:${fontFamily};${bgStyle}color:white;display:flex;justify-content:center;align-items:center;min-height:100vh;}.card{background:rgba(30,30,30,0.85);border-radius:20px;padding:30px;box-shadow:0 10px 30px rgba(0,0,0,0.5);width:500px;border:1px solid #444;}.header{display:flex;align-items:center;margin-bottom:20px;}.info{flex:1;}.hostname{font-size:28px;font-weight:bold;margin-bottom:5px;}.version{font-size:18px;color:#aaa;}.status{font-size:20px;font-weight:bold;color:${onlineColor};text-align:right;}.players{background:#444;border-radius:10px;padding:15px;margin:15px 0;display:flex;justify-content:space-between;font-size:22px;}.motd{background:#333;border-radius:10px;padding:15px;margin:15px 0;font-size:18px;line-height:1.5;color:#ddd;}.details{display:flex;gap:20px;font-size:16px;color:#aaa;}.ping{color:#8BC34A;font-weight:bold;}</style></head><body><div class="card"><div class="header">${iconHtml}<div class="info"><div class="hostname">${hostDisplay}</div><div class="version">版本: ${version}</div></div><div class="status">${online ? '在线' : '离线'}</div></div><div class="players"><span>👥 ${playerOnline}/${playerMax}</span><span>🟢 在线率 ${playerMax > 0 ? Math.round((playerOnline/playerMax)*100) : 0}%</span></div>${motdText ? `<div class="motd">${motdText}</div>` : ''}<div class="details">${software ? `<span>⚙️ ${software}</span>` : ''}${ping ? `<span class="ping">📶 ${ping}ms</span>` : ''}</div></div></body></html>`
-
+  async function readVersionCache(): Promise<{ releaseId: string; snapshotId: string }> {
     try {
-      const page = await puppeteer.page()
-      await page.setViewport({ width: 600, height: 400, deviceScaleFactor: 1 })
-      await page.setContent(html)
-      await page.waitForNetworkIdle({ idleTime: 500 })
-      const image = await page.screenshot({ type: 'jpeg', quality: 90, fullPage: true })
-      await page.close()
-      return image as Buffer
-    } catch {
-      return null
+      const rows = await ctx.database.get('mc_version_cache', { id: 1 })
+      if (rows.length) return { releaseId: rows[0].releaseId, snapshotId: rows[0].snapshotId }
+    } catch (error: any) {
+      debugLog(`[mc-update] 读取缓存失败: ${error.message}`)
     }
+    return { releaseId: '', snapshotId: '' }
+  }
+
+  async function writeVersionCache(info: VersionInfo): Promise<void> {
+    try {
+      await ctx.database.upsert('mc_version_cache', [{
+        id: 1,
+        releaseId: info.release.id,
+        snapshotId: info.snapshot.id,
+        updatedAt: new Date(),
+      }])
+    } catch (error: any) {
+      debugLog(`[mc-update] 写入缓存失败: ${error.message}`)
+    }
+  }
+
+  async function refreshVersionCache(): Promise<VersionInfo | null> {
+    const info = await fetchVersionInfo()
+    if (info) await writeVersionCache(info)
+    return info
+  }
+
+  const assets: ServerAssets = {}
+
+  ctx.on('ready', async () => {
+    if (getPuppeteer()) {
+      const sourceDir = path.resolve(__dirname, '../source')
+      const fontPath = path.resolve(sourceDir, '荆南麦圆体.otf')
+      const bgPath = path.resolve(sourceDir, 'qzbknd.png')
+      if (fs.existsSync(fontPath)) assets.fontPath = fontPath
+      if (fs.existsSync(bgPath)) assets.bgPath = bgPath
+    }
+    const info = await refreshVersionCache()
+    if (info && config.debug) {
+      logger.info(`[mc-update] 启动时缓存版本: release=${info.release.id}, snapshot=${info.snapshot.id}`)
+    }
+  })
+
+  function getGlobalServers(): ServerTarget[] {
+    return config.globalServers.map((address) => ({ address, type: config.globalServerType }))
   }
 
   ctx.command('mc-check [address:text]', '查询 Minecraft 服务器状态')
     .option('type', '-t <type:string>')
-    .action(async ({ session, options }: any, address: string | undefined) => {
+    .action(async ({ options }, address?: string) => {
       debugLog(`[mc-check] 指令触发，参数: address=${address}, type=${options?.type}`)
-      const requestedType: 'java' | 'bedrock' = (options?.type as 'java' | 'bedrock') || config.globalServerType
-      if (!address) {
-        const targets = getGlobalServers()
-        if (!targets.length) return t('mcCheckNoGlobal')
-        debugLog(`[mc-check] 批量查询目标: ${JSON.stringify(targets.map((t: any) => t.address))}`)
-        const CONCURRENCY = 5
-        const results: string[] = []
-        for (let i = 0; i < targets.length; i += CONCURRENCY) {
-          const batch = targets.slice(i, i + CONCURRENCY)
-          const batchResults = await Promise.all(batch.map(async (target: any) => {
-            const status = await fetchWithFallback(target.address, target.type)
-            return formatStatus(status, target.address)
-          }))
-          results.push(...batchResults)
+      if (address) {
+        let requestedType = config.globalServerType
+        if (options?.type) {
+          if (options.type === 'java' || options.type === 'bedrock') {
+            requestedType = options.type
+          } else {
+            return t('mcCheckInvalidType')
+          }
         }
-        return results.join('\n\n')
-      }
-
-      const status = await fetchWithFallback(address, requestedType)
-
-      if (cardImageEnabled) {
-        const img = await renderStatusCard(status, address)
-        if (img) return h.image(img, 'image/jpeg')
+        const status = await fetchWithFallback(address, requestedType)
+        if (config.enableCardImage) {
+          const puppeteer = getPuppeteer()
+          if (puppeteer) {
+            const image = await renderStatusCard(puppeteer, status, address, assets)
+            if (image) return h.image(image, 'image/jpeg')
+          }
+        }
         return formatStatus(status, address)
       }
-      return formatStatus(status, address)
+      const targets = getGlobalServers()
+      if (!targets.length) return t('mcCheckNoGlobal')
+      debugLog(`[mc-check] 批量查询目标: ${JSON.stringify(targets.map((target) => target.address))}`)
+      const CONCURRENCY = 5
+      const results: string[] = []
+      for (let i = 0; i < targets.length; i += CONCURRENCY) {
+        const batch = targets.slice(i, i + CONCURRENCY)
+        const batchResults = await Promise.all(batch.map(async (target) => {
+          const status = await fetchWithFallback(target.address, target.type)
+          return formatStatus(status, target.address)
+        }))
+        results.push(...batchResults)
+      }
+      return results.join('\n\n')
     })
 
   ctx.command('mc-skin <player:text>', '查看正版玩家皮肤')
-    .action(async ({ session }: any, player: string | undefined) => {
+    .action(async (_argv, player?: string) => {
       debugLog(`[mc-skin] 查询皮肤: ${player}`)
       if (!player) return t('skinNotFound')
       const buffer = await fetchSkin(player)
@@ -470,110 +334,79 @@ export function apply(ctx: Context, config: McCheckConfig) {
     })
 
   ctx.command('mc-update', '查看版本更新')
-    .action(async ({ session }: any) => {
+    .action(async () => {
       debugLog('[mc-update] 检查版本')
       try {
-        const versionInfo = await fetchVersionInfo()
-        if (!versionInfo) return t('mcUpdateError')
-        const { release, snapshot } = versionInfo
-
-        const cached = await ctx.database.get('mc_version_cache', {})
-        const lastRelease = cached.length ? cached[0].releaseId : ''
-        const lastSnapshot = cached.length ? cached[0].snapshotId : ''
-
-        if (release.id === lastRelease && snapshot.id === lastSnapshot) {
+        const info = await fetchVersionInfo()
+        if (!info) return t('mcUpdateError')
+        const { release, snapshot } = info
+        const cached = await readVersionCache()
+        if (release.id === cached.releaseId && snapshot.id === cached.snapshotId) {
           return t('mcUpdateNoUpdate')
         }
-
-        if (cached.length) {
-          await ctx.database.set('mc_version_cache', { id: cached[0].id }, {
-            releaseId: release.id,
-            snapshotId: snapshot.id,
-            updatedAt: new Date(),
-          })
-        } else {
-          await ctx.database.create('mc_version_cache', {
-            releaseId: release.id,
-            snapshotId: snapshot.id,
-          })
-        }
-
+        await writeVersionCache(info)
         const parts: string[] = []
-        if (release.id !== lastRelease) {
+        if (release.id !== cached.releaseId) {
           parts.push(`${t('mcUpdateRelease')}: ${release.id}`)
           parts.push(`  时间: ${new Date(release.releaseTime).toLocaleString('zh-CN')}`)
         }
-        if (snapshot.id !== lastSnapshot) {
+        if (snapshot.id !== cached.snapshotId) {
           parts.push(`${t('mcUpdateSnapshot')}: ${snapshot.id}`)
           parts.push(`  时间: ${new Date(snapshot.releaseTime).toLocaleString('zh-CN')}`)
         }
         return parts.join('\n')
-      } catch (e: any) {
-        debugLog(`[mc-update] 检查版本失败: ${e.message}`)
-        return `${t('mcUpdateError')}（${e.message}）`
+      } catch (error: any) {
+        debugLog(`[mc-update] 检查版本失败: ${error.message}`)
+        return `${t('mcUpdateError')}（${error.message}）`
       }
     })
 
-  function scheduleDailyTask(timeStr: string, task: () => void) {
-    const { hour, minute } = parseTime(timeStr)
-    const now = new Date()
-    const target = new Date(now)
-    target.setHours(hour, minute, 0, 0)
-    if (target <= now) target.setDate(target.getDate() + 1)
-    const delay = target.getTime() - now.getTime()
-    setTimeout(() => {
-      task()
-      scheduleDailyTask(timeStr, task)
-    }, delay)
+  async function pushVersionUpdate(): Promise<void> {
+    debugLog('[auto-update] 定时检查版本')
+    try {
+      const info = await fetchVersionInfo()
+      if (!info) return
+      const { release, snapshot } = info
+      const cached = await readVersionCache()
+      if (release.id === cached.releaseId && snapshot.id === cached.snapshotId) return
+      await writeVersionCache(info)
+      const parts: string[] = []
+      if (release.id !== cached.releaseId) parts.push(`🟢 正式版 ${release.id} 发布`)
+      if (snapshot.id !== cached.snapshotId) parts.push(`🟠 快照版 ${snapshot.id} 发布`)
+      const message = parts.join('\n')
+      if (!message) return
+      for (const bot of ctx.bots) {
+        try {
+          let next: string | undefined
+          do {
+            const guilds = await bot.getGuildList(next)
+            for (const guild of guilds.data) {
+              const channelId = (guild as { channelId?: string }).channelId || guild.id
+              await bot.sendMessage(channelId, message).catch(() => {})
+            }
+            next = guilds.next
+          } while (next)
+        } catch (error: any) {
+          debugLog(`[auto-update] 获取群列表失败: ${error.message}`)
+        }
+      }
+    } catch (error: any) {
+      debugLog(`[auto-update] 推送失败: ${error.message}`)
+    }
   }
 
   if (config.enableAutoUpdatePush) {
-    scheduleDailyTask(config.autoUpdateTime, async () => {
-      debugLog('[auto-update] 定时检查版本')
-      try {
-        const versionInfo = await fetchVersionInfo()
-        if (!versionInfo) return
-        const { release, snapshot } = versionInfo
-
-        const cached = await ctx.database.get('mc_version_cache', {})
-        const lastRelease = cached.length ? cached[0].releaseId : ''
-        const lastSnapshot = cached.length ? cached[0].snapshotId : ''
-
-        if (release.id === lastRelease && snapshot.id === lastSnapshot) return
-
-        if (cached.length) {
-          await ctx.database.set('mc_version_cache', { id: cached[0].id }, {
-            releaseId: release.id,
-            snapshotId: snapshot.id,
-            updatedAt: new Date(),
-          })
-        } else {
-          await ctx.database.create('mc_version_cache', {
-            releaseId: release.id,
-            snapshotId: snapshot.id,
-          })
-        }
-
-        const parts: string[] = []
-        if (release.id !== lastRelease) parts.push(`🟢 正式版 ${release.id} 发布`)
-        if (snapshot.id !== lastSnapshot) parts.push(`🟠 快照版 ${snapshot.id} 发布`)
-        const message = parts.join('\n')
-        if (!message) return
-
-        for (const bot of ctx.bots) {
-          try {
-            const guilds: any = await bot.getGuildList()
-            for (const guild of guilds) {
-              const targetId = guild.guildId || guild.id
-              if (targetId) {
-                await bot.sendMessage(targetId, message).catch(() => {})
-              }
-            }
-          } catch (err: any) {
-            debugLog(`[auto-update] 获取群列表失败: ${err.message}`)
-          }
-        }
-      } catch { }
-    })
+    const schedule = () => {
+      const { hour, minute } = parseTime(config.autoUpdateTime)
+      const now = new Date()
+      const target = new Date(now)
+      target.setHours(hour, minute, 0, 0)
+      if (target <= now) target.setDate(target.getDate() + 1)
+      ctx.setTimeout(() => {
+        pushVersionUpdate()
+        schedule()
+      }, target.getTime() - now.getTime())
+    }
+    schedule()
   }
 }
