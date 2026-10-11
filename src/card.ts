@@ -10,14 +10,20 @@ function fileUrl(filePath: string): string {
 }
 
 async function buildTemplate(assets: ServerAssets, inline: boolean): Promise<string> {
-  const font = assets.fontPath
-    ? `@font-face{font-family:'MinecraftFont';src:url('${inline ? await toDataUri(assets.fontPath) : fileUrl(assets.fontPath)}');}`
+  const fontSource = assets.fontPath
+    ? (inline ? await toDataUri(assets.fontPath) || fileUrl(assets.fontPath) : fileUrl(assets.fontPath))
+    : ''
+  const font = fontSource
+    ? `@font-face{font-family:'MinecraftFont';src:url('${fontSource}');}`
     : ''
   const fontFamily = assets.fontPath
     ? "'MinecraftFont','Segoe UI',Tahoma,Geneva,Verdana,sans-serif"
     : "'Segoe UI',Tahoma,Geneva,Verdana,sans-serif"
-  const bgStyle = assets.bgPath
-    ? `background-image:url('${inline ? await toDataUri(assets.bgPath) : fileUrl(assets.bgPath)}');background-size:cover;background-position:center;`
+  const bgSource = assets.bgPath
+    ? (inline ? await toDataUri(assets.bgPath) || fileUrl(assets.bgPath) : fileUrl(assets.bgPath))
+    : ''
+  const bgStyle = bgSource
+    ? `background-image:url('${bgSource}');background-size:cover;background-position:center;`
     : 'background:#1e1e1e;'
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>${font}body{margin:0;padding:30px;font-family:${fontFamily};${bgStyle}color:white;display:flex;justify-content:center;align-items:center;min-height:100vh;}.card{background:rgba(30,30,30,0.85);border-radius:20px;padding:30px;box-shadow:0 10px 30px rgba(0,0,0,0.5);width:500px;border:1px solid #444;}.header{display:flex;align-items:center;margin-bottom:20px;}.info{flex:1;}.hostname{font-size:28px;font-weight:bold;margin-bottom:5px;}.version{font-size:18px;color:#aaa;}.status{font-size:20px;font-weight:bold;text-align:right;}.players{background:#444;border-radius:10px;padding:15px;margin:15px 0;display:flex;justify-content:space-between;font-size:22px;}.motd{background:#333;border-radius:10px;padding:15px;margin:15px 0;font-size:18px;line-height:1.5;color:#ddd;}.details{display:flex;gap:20px;font-size:16px;color:#aaa;}.ping{color:#8BC34A;font-weight:bold;}</style></head><body><div class="card"><div class="header"><img id="icon" style="width:64px;height:64px;border-radius:8px;margin-right:16px;display:none;"><div class="info"><div id="hostname" class="hostname"></div><div id="version" class="version"></div></div><div id="status" class="status"></div></div><div class="players"><span id="players"></span><span id="rate"></span></div><div id="motd" class="motd" style="display:none;"></div><div id="details" class="details"></div></div></body></html>`
 }
@@ -29,8 +35,6 @@ function buildDetailsHtml(status: ServerStatus): string {
   return html
 }
 
-let templateFile = ''
-
 export async function renderStatusCard(
   puppeteer: any,
   status: ServerStatus,
@@ -38,15 +42,15 @@ export async function renderStatusCard(
   assets: ServerAssets,
 ): Promise<Buffer | null> {
   let page: any
+  let templatePath = ''
   try {
+    if (!puppeteer || typeof puppeteer.page !== 'function') return null
     page = await puppeteer.page()
     await page.setViewport({ width: 600, height: 400, deviceScaleFactor: 1 })
     try {
-      if (!templateFile) {
-        templateFile = path.join(os.tmpdir(), `koishi-mc-card-${process.pid}.html`)
-        await fs.promises.writeFile(templateFile, await buildTemplate(assets, false))
-      }
-      await page.goto(fileUrl(templateFile))
+      templatePath = path.join(os.tmpdir(), `koishi-mc-card-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.html`)
+      await fs.promises.writeFile(templatePath, await buildTemplate(assets, false))
+      await page.goto(fileUrl(templatePath))
     } catch {
       await page.setContent(await buildTemplate(assets, true))
     }
@@ -97,15 +101,28 @@ export async function renderStatusCard(
       detailsHtml: buildDetailsHtml(status),
     })
     if (typeof page.waitForNetworkIdle === 'function') {
-      await page.waitForNetworkIdle({ idleTime: 500 }).catch(() => page.waitForTimeout(500))
+      await page.waitForNetworkIdle({ idleTime: 500 }).catch(async () => {
+        if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(500)
+        else await new Promise(resolve => setTimeout(resolve, 500))
+      })
     } else {
-      await page.waitForTimeout(500)
+      if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(500)
+      else await new Promise(resolve => setTimeout(resolve, 500))
     }
     const image = await page.screenshot({ type: 'jpeg', quality: 90, fullPage: true })
     return image as Buffer
   } catch {
     return null
   } finally {
-    if (page) await page.close().catch(() => {})
+    if (page && typeof page.close === 'function') {
+      try {
+        await page.close()
+      } catch {}
+    }
+    if (templatePath) {
+      try {
+        await fs.promises.unlink(templatePath)
+      } catch {}
+    }
   }
 }

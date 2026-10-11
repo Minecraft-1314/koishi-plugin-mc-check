@@ -19,8 +19,20 @@ function isManagerRole(role: any): boolean {
   const id = String(role?.id ?? '').toLowerCase().replace(/\s+/g, '')
   if (MANAGER_IDS.has(id)) return true
   const name = String(role?.name ?? '').toLowerCase().replace(/\s+/g, '')
+  const permissions = role?.permissions
+  const hasAdminPermission = typeof permissions === 'bigint'
+    ? (permissions & ADMIN_PERMISSION_BIT) === ADMIN_PERMISSION_BIT
+    : typeof permissions === 'number' && (permissions & Number(ADMIN_PERMISSION_BIT)) === Number(ADMIN_PERMISSION_BIT)
   return MANAGER_NAMES.some(keyword => name.includes(keyword))
-    || (typeof role?.permissions === 'bigint' && (role.permissions & ADMIN_PERMISSION_BIT) === ADMIN_PERMISSION_BIT)
+    || hasAdminPermission
+}
+
+function getDatabase(ctx: Context): any {
+  return (ctx as any).database || (ctx as any).get?.('database')
+}
+
+function hasDatabase(ctx: Context): boolean {
+  return Boolean(getDatabase(ctx))
 }
 
 async function isGroupManager(ctx: Context, session: Session, logger: Logger): Promise<boolean> {
@@ -45,7 +57,9 @@ async function isGroupManager(ctx: Context, session: Session, logger: Logger): P
   }
 
   try {
-    const user = await ctx.database.getUser(session.platform, userId, ['authority']) as any
+    const database = getDatabase(ctx)
+    if (!database) return false
+    const user = await database.getUser(session.platform, userId, ['authority']) as any
     return (user?.authority ?? 0) >= 4
   } catch {
     return false
@@ -58,8 +72,10 @@ function renderStatus(enabled: boolean, scope: 'group' | 'private'): string {
 }
 
 async function getUserEnabled(ctx: Context, platform: string, userId: string): Promise<boolean> {
+  const database = getDatabase(ctx)
+  if (!database) return false
   try {
-    const user = await ctx.database.getUser(platform, userId, ['mcUpdateEnabled']) as any
+    const user = await database.getUser(platform, userId, ['mcUpdateEnabled']) as any
     return user?.mcUpdateEnabled === true
   } catch {
     return false
@@ -67,13 +83,15 @@ async function getUserEnabled(ctx: Context, platform: string, userId: string): P
 }
 
 async function setUserEnabled(ctx: Context, platform: string, userId: string, enabled: boolean): Promise<boolean> {
+  const database = getDatabase(ctx)
+  if (!database) return false
   const data = { mcUpdateEnabled: enabled }
   try {
-    await ctx.database.setUser(platform, userId, data)
+    await database.setUser(platform, userId, data)
     return true
   } catch {
     try {
-      await ctx.database.createUser(platform, userId, data)
+      await database.createUser(platform, userId, data)
       return true
     } catch {
       return false
@@ -82,8 +100,10 @@ async function setUserEnabled(ctx: Context, platform: string, userId: string, en
 }
 
 async function getChannelEnabled(ctx: Context, platform: string, channelId: string): Promise<boolean> {
+  const database = getDatabase(ctx)
+  if (!database) return false
   try {
-    const channel = await ctx.database.getChannel(platform, channelId, ['mcUpdateEnabled']) as any
+    const channel = await database.getChannel(platform, channelId, ['mcUpdateEnabled']) as any
     return channel?.mcUpdateEnabled === true
   } catch {
     return false
@@ -91,20 +111,22 @@ async function getChannelEnabled(ctx: Context, platform: string, channelId: stri
 }
 
 async function setChannelEnabled(ctx: Context, platform: string, channelId: string, enabled: boolean): Promise<boolean> {
+  const database = getDatabase(ctx)
+  if (!database) return false
   const data = { mcUpdateEnabled: enabled }
   try {
-    const channel = await ctx.database.getChannel(platform, channelId, ['mcUpdateEnabled']) as any
+    const channel = await database.getChannel(platform, channelId, ['mcUpdateEnabled']) as any
     if (channel) {
-      await ctx.database.setChannel(platform, channelId, data)
+      await database.setChannel(platform, channelId, data)
       return true
     }
   } catch {}
   try {
-    await ctx.database.createChannel(platform, channelId, data)
+    await database.createChannel(platform, channelId, data)
     return true
   } catch {
     try {
-      await ctx.database.setChannel(platform, channelId, data)
+      await database.setChannel(platform, channelId, data)
       return true
     } catch {
       return false
@@ -113,13 +135,14 @@ async function setChannelEnabled(ctx: Context, platform: string, channelId: stri
 }
 
 async function getEnabledUserIds(ctx: Context, platform: string, userIds: string[]): Promise<Set<string>> {
-  if (!userIds.length) return new Set()
+  const database = getDatabase(ctx)
+  if (!userIds.length || !database) return new Set()
   try {
-    const bindings = await ctx.database.get('binding', { platform, pid: { $in: userIds } } as any, ['aid', 'pid']) as any[]
+    const bindings = await database.get('binding', { platform, pid: { $in: userIds } } as any, ['aid', 'pid']) as any[]
     if (!bindings.length) return new Set()
     const pidByAid = new Map<number, string>()
     for (const binding of bindings) pidByAid.set(binding.aid, binding.pid)
-    const users = await ctx.database.get('user', {
+    const users = await database.get('user', {
       id: { $in: [...pidByAid.keys()] },
     } as any, ['id', 'mcUpdateEnabled']) as any[]
     const enabled = new Set<string>()
@@ -135,9 +158,10 @@ async function getEnabledUserIds(ctx: Context, platform: string, userIds: string
 }
 
 async function getEnabledChannelIds(ctx: Context, platform: string, channelIds: string[]): Promise<Set<string>> {
-  if (!channelIds.length) return new Set()
+  const database = getDatabase(ctx)
+  if (!channelIds.length || !database) return new Set()
   try {
-    const rows = await ctx.database.get('channel', {
+    const rows = await database.get('channel', {
       platform,
       id: { $in: channelIds },
     } as any, ['id', 'mcUpdateEnabled']) as any[]
@@ -220,7 +244,9 @@ async function filterTargets(ctx: Context, targets: PushTarget[], scope: 'user' 
 async function collectTargets(ctx: Context): Promise<{ users: PushTarget[]; groups: PushTarget[] }> {
   const users: PushTarget[] = []
   const groups: PushTarget[] = []
-  for (const bot of ctx.bots) {
+  if (!hasDatabase(ctx)) return { users, groups }
+  const bots = Array.from((ctx as any).bots || []) as Bot[]
+  for (const bot of bots) {
     if (!bot) continue
     users.push(...await getFriends(bot))
     groups.push(...await getGroups(bot))
@@ -232,10 +258,16 @@ async function collectTargets(ctx: Context): Promise<{ users: PushTarget[]; grou
 }
 
 export async function sendUpdatePush(ctx: Context, message: string): Promise<{ success: number; fail: number }> {
-  const targets = await collectTargets(ctx)
   let success = 0
   let fail = 0
   const logger = ctx.logger('mc-check')
+  let targets: { users: PushTarget[]; groups: PushTarget[] }
+  try {
+    targets = await collectTargets(ctx)
+  } catch (error) {
+    logger.warn(`收集更新推送目标失败: ${error}`)
+    return { success, fail }
+  }
   for (const target of targets.groups) {
     try {
       await target.bot.sendMessage(target.id, message)
@@ -257,27 +289,51 @@ export async function sendUpdatePush(ctx: Context, message: string): Promise<{ s
   return { success, fail }
 }
 
-export function setupUpdatePush(ctx: Context, logger: Logger): void {
-  try {
-    ctx.model.extend('user', {
-      mcUpdateEnabled: 'boolean',
-    })
-  } catch (error) {
-    logger.warn(`扩展用户推送偏好字段失败：${error}`)
-  }
-  try {
-    ctx.model.extend('channel', {
-      mcUpdateEnabled: 'boolean',
-    })
-  } catch (error) {
-    logger.warn(`扩展群聊推送偏好字段失败：${error}`)
+export function setupUpdatePush(ctx: Context, logger: Logger, getDatabaseMessage: () => string): void {
+  ctx.inject(['database'], (databaseCtx) => {
+    try {
+      databaseCtx.model.extend('user', {
+        mcUpdateEnabled: 'boolean',
+      })
+    } catch (error) {
+      logger.warn(`扩展用户推送偏好字段失败：${error}`)
+    }
+    try {
+      databaseCtx.model.extend('channel', {
+        mcUpdateEnabled: 'boolean',
+      })
+    } catch (error) {
+      logger.warn(`扩展群聊推送偏好字段失败：${error}`)
+    }
+  })
+
+  function register(
+    definition: string,
+    description: string,
+    aliases: string[],
+    action: (argv: any) => Promise<string>,
+  ): void {
+    try {
+      const command = ctx.command(definition, description)
+      for (const alias of aliases) {
+        try {
+          command.alias(alias)
+        } catch (error) {
+          logger.warn(`注册指令别名 ${alias} 失败：${error}`)
+        }
+      }
+      command.action(action)
+    } catch (error) {
+      logger.warn(`注册指令 ${definition} 失败：${error}`)
+    }
   }
 
-  ctx.command('接收更新推送', '开启当前私聊或本群的版本更新推送')
-    .alias('接收我的世界更新')
-    .alias('更新推送开启')
-    .action(async ({ session }) => {
+  register('接收更新推送', '开启当前私聊或本群的版本更新推送', [
+    '接收我的世界更新',
+    '更新推送开启',
+  ], async ({ session }) => {
       if (!session) return '会话不可用'
+      if (!hasDatabase(ctx)) return getDatabaseMessage()
       if (session.guildId) {
         if (!await isGroupManager(ctx, session, logger)) return '只有群主或群管理员可以设置本群更新推送'
         if (!await setChannelEnabled(ctx, session.platform, (session.channelId || session.guildId)!, true)) return SETTINGS_ERROR
@@ -288,11 +344,12 @@ export function setupUpdatePush(ctx: Context, logger: Logger): void {
       return renderStatus(true, 'private')
     })
 
-  ctx.command('关闭更新推送', '关闭当前私聊或本群的版本更新推送')
-    .alias('关闭我的世界更新')
-    .alias('更新推送关闭')
-    .action(async ({ session }) => {
+  register('关闭更新推送', '关闭当前私聊或本群的版本更新推送', [
+    '关闭我的世界更新',
+    '更新推送关闭',
+  ], async ({ session }) => {
       if (!session) return '会话不可用'
+      if (!hasDatabase(ctx)) return getDatabaseMessage()
       if (session.guildId) {
         if (!await isGroupManager(ctx, session, logger)) return '只有群主或群管理员可以设置本群更新推送'
         if (!await setChannelEnabled(ctx, session.platform, (session.channelId || session.guildId)!, false)) return SETTINGS_ERROR
@@ -303,11 +360,12 @@ export function setupUpdatePush(ctx: Context, logger: Logger): void {
       return renderStatus(false, 'private')
     })
 
-  ctx.command('更新推送状态', '查看当前私聊或本群的版本更新推送状态')
-    .alias('我的世界更新状态')
-    .alias('查看更新推送')
-    .action(async ({ session }) => {
+  register('更新推送状态', '查看当前私聊或本群的版本更新推送状态', [
+    '我的世界更新状态',
+    '查看更新推送',
+  ], async ({ session }) => {
       if (!session) return '会话不可用'
+      if (!hasDatabase(ctx)) return getDatabaseMessage()
       if (session.guildId) {
         const enabled = await getChannelEnabled(ctx, session.platform, (session.channelId || session.guildId)!)
         return renderStatus(enabled, 'group')

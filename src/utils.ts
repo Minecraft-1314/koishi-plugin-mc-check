@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import type { PlayerEntry, ServerStatus } from './types'
 
 export function parseHostPort(raw: string, defaultPort: number): { host: string; port: number } {
+  if (typeof raw !== 'string' || !raw.trim()) return { host: String(raw ?? ''), port: defaultPort }
+  raw = raw.trim()
   const match = raw.match(/^(.+):(\d{1,5})$/)
   if (match) {
     const port = Number(match[2])
@@ -13,6 +15,7 @@ export function parseHostPort(raw: string, defaultPort: number): { host: string;
 }
 
 export function parseTime(timeStr: string): { hour: number; minute: number } {
+  if (typeof timeStr !== 'string') return { hour: 9, minute: 0 }
   const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(timeStr)
   if (!match) return { hour: 9, minute: 0 }
   return { hour: Number(match[1]), minute: Number(match[2]) }
@@ -29,6 +32,10 @@ export function escapeHtml(str: string): string {
 
 export function tcpPing(host: string, port: number): Promise<number | null> {
   return new Promise((resolve) => {
+    if (typeof host !== 'string' || !host || !Number.isInteger(port) || port < 1 || port > 65535) {
+      resolve(null)
+      return
+    }
     const start = Date.now()
     const socket = new net.Socket()
     let settled = false
@@ -42,7 +49,11 @@ export function tcpPing(host: string, port: number): Promise<number | null> {
     socket.once('connect', () => done(Date.now() - start))
     socket.once('error', () => done(null))
     socket.once('timeout', () => done(null))
-    socket.connect(port, host)
+    try {
+      socket.connect(port, host.replace(/^\[/, '').replace(/\]$/, ''))
+    } catch {
+      done(null)
+    }
   })
 }
 
@@ -62,24 +73,30 @@ export async function toDataUri(filePath: string): Promise<string> {
 }
 
 function playerName(player: PlayerEntry): string {
-  return typeof player === 'string' ? player : (player.name || player.name_clean || '未知玩家')
+  if (typeof player === 'string') return player
+  return player?.name || player?.name_clean || '未知玩家'
 }
 
 export function formatStatus(status: ServerStatus, label: string): string {
+  if (!status) {
+    return `❌ ${escapeHtml(label)} - 离线`
+  }
+  const players = status?.players || { online: 0, max: 0, list: [] }
+  const list = Array.isArray(players.list) ? players.list : []
   if (!status.online) {
-    const suffix = status.error ? ` (${escapeHtml(status.error)})` : ''
+    const suffix = status.error ? ` (${escapeHtml(String(status.error))})` : ''
     return `❌ ${escapeHtml(label)} - 离线${suffix}`
   }
-  const shown = status.players.list.slice(0, 20)
-  const onlineText = status.players.online && shown.length
-    ? `\n  在线: ${shown.map(playerName).map(escapeHtml).join(', ')}${status.players.list.length > 20 ? ' 等' : ''}`
+  const shown = list.slice(0, 20)
+  const onlineText = players.online && shown.length
+    ? `\n  在线: ${shown.map(playerName).map(escapeHtml).join(', ')}${list.length > 20 ? ' 等' : ''}`
     : ''
   const pingText = status.ping !== null ? `  📶 ${status.ping}ms` : ''
   const softwareText = status.software ? `\n⚙️ 服务端: ${escapeHtml(status.software)}` : ''
   return [
     `🟢 ${escapeHtml(label)}:${status.port}${pingText}`,
     `📋 版本: ${escapeHtml(status.version)}`,
-    `👥 玩家: ${status.players.online}/${status.players.max}${onlineText}`,
+    `👥 玩家: ${players.online}/${players.max}${onlineText}`,
     status.motd ? `💬 MOTD: ${escapeHtml(status.motd)}` : '',
     softwareText,
   ].filter(Boolean).join('\n')

@@ -70,7 +70,7 @@ A comprehensive Minecraft plugin for the Koishi bot framework, using free public
 | `puppeteerRequired` | `需要安装并启用 puppeteer 服务才能使用此功能。` | 缺少 Puppeteer 提示 |
 
 ## 依赖 (Dependencies)
-- **Koishi 数据库插件**：需安装并启用任意数据库插件（如 `database-sqlite`），用于存储版本缓存。
+- **Koishi 数据库插件**（可选）：安装后可存储版本缓存并启用推送偏好；未安装时服务器查询、皮肤和版本查看仍可使用，推送设置会返回数据库缺失提示。
 - **Puppeteer 服务**（可选）：若需使用状态卡片图片生成，请安装 `koishi-plugin-puppeteer`；未安装时插件会自动降级为文本输出。
 
 ## 使用的 API (APIs Used)
@@ -83,16 +83,6 @@ A comprehensive Minecraft plugin for the Koishi bot framework, using free public
 | 玩家 UUID | `api.mojang.com` | 正版玩家名 → UUID |
 | 皮肤渲染 | `visage.surgeplay.com` | 正版 3D 全身皮肤渲染 |
 | 版本清单 | `piston-meta.mojang.com` | Mojang 官方版本信息（release + snapshot） |
-
-## 功能特性
-- 完善的服务器状态查询，支持 Java / Bedrock 协议及离线自动回退
-- 本地 TCP Ping 测量延迟，精准稳定
-- 正版皮肤预览
-- 版本更新智能缓存，启动时获取，对比变化，避免重复请求
-- 更新推送首行固定显示“我的世界更新”，并按群聊/私聊接收偏好过滤发送对象
-- 所有提示文本均可通过配置界面自定义
-- 详细的 Debug 日志，便于排查网络与 API 问题
-- 卡片渲染失败时自动降级为文本，保证功能可用性
 
 ## 项目贡献者 (Contributors)
 
