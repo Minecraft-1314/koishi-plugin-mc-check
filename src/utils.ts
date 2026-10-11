@@ -6,6 +6,16 @@ import type { PlayerEntry, ServerStatus } from './types'
 export function parseHostPort(raw: string, defaultPort: number): { host: string; port: number } {
   if (typeof raw !== 'string' || !raw.trim()) return { host: String(raw ?? ''), port: defaultPort }
   raw = raw.trim()
+  const bracketed = /^\[([^\]]+)\](?::(\d{1,5}))?$/.exec(raw)
+  if (bracketed) {
+    const host = `[${bracketed[1]}]`
+    const port = bracketed[2] ? Number(bracketed[2]) : defaultPort
+    if (port >= 1 && port <= 65535) return { host, port }
+    return { host: raw, port: defaultPort }
+  }
+  if (raw.includes(':') && raw.indexOf(':') !== raw.lastIndexOf(':')) {
+    return { host: raw, port: defaultPort }
+  }
   const match = raw.match(/^(.+):(\d{1,5})$/)
   if (match) {
     const port = Number(match[2])
@@ -77,13 +87,16 @@ function playerName(player: PlayerEntry): string {
   return player?.name || player?.name_clean || '未知玩家'
 }
 
-export function formatStatus(status: ServerStatus, label: string): string {
+export function formatStatus(status: ServerStatus, label: string, timeoutMessage = ''): string {
   if (!status) {
     return `❌ ${escapeHtml(label)} - 离线`
   }
   const players = status?.players || { online: 0, max: 0, list: [] }
   const list = Array.isArray(players.list) ? players.list : []
   if (!status.online) {
+    if (timeoutMessage && status.error && /timeout|timed out|etimedout|esockettimedout/i.test(status.error)) {
+      return `❌ ${escapeHtml(label)} - ${escapeHtml(timeoutMessage)}`
+    }
     const suffix = status.error ? ` (${escapeHtml(String(status.error))})` : ''
     return `❌ ${escapeHtml(label)} - 离线${suffix}`
   }

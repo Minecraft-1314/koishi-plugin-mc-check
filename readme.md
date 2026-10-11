@@ -56,7 +56,6 @@ A comprehensive Minecraft plugin for the Koishi bot framework, using free public
 
 | 消息键 | 默认值 | 说明 |
 |--------|--------|------|
-| `mcCheckNoServer` | `请提供服务器地址` | 无服务器提示 |
 | `mcCheckNoGlobal` | `未配置全局服务器` | 无全局服务器提示 |
 | `mcCheckTimeout` | `查询超时` | 查询超时提示 |
 | `mcUpdateNoUpdate` | `当前已是最新版本，暂无更新。` | 无更新提示 |

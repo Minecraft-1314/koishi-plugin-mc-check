@@ -5,8 +5,36 @@ import { pathToFileURL } from 'node:url'
 import { escapeHtml, toDataUri } from './utils'
 import type { ServerAssets, ServerStatus } from './types'
 
+const PAGE_TIMEOUT = 10000
+const RENDER_TIMEOUT = 20000
+
 function fileUrl(filePath: string): string {
   return pathToFileURL(filePath).href
+}
+
+function safeIcon(value: any): string {
+  if (typeof value !== 'string') return ''
+  if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(value)) return value
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? value : ''
+  } catch {
+    return ''
+  }
+}
+
+async function withTimeout<T>(task: Promise<T>, timeout: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      task,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('render timeout')), timeout)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 async function buildTemplate(assets: ServerAssets, inline: boolean): Promise<string> {
@@ -45,7 +73,7 @@ export async function renderStatusCard(
   let templatePath = ''
   try {
     if (!puppeteer || typeof puppeteer.page !== 'function') return null
-    page = await puppeteer.page()
+    page = await withTimeout(Promise.resolve(puppeteer.page()), PAGE_TIMEOUT)
     await page.setViewport({ width: 600, height: 400, deviceScaleFactor: 1 })
     try {
       templatePath = path.join(os.tmpdir(), `koishi-mc-card-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.html`)
@@ -97,19 +125,21 @@ export async function renderStatusCard(
       playerMax: status.players.max,
       rate: status.players.max > 0 ? Math.round((status.players.online / status.players.max) * 100) : 0,
       motd: status.motd,
-      icon: status.icon,
+      icon: safeIcon(status.icon),
       detailsHtml: buildDetailsHtml(status),
     })
-    if (typeof page.waitForNetworkIdle === 'function') {
-      await page.waitForNetworkIdle({ idleTime: 500 }).catch(async () => {
+    const image = await withTimeout((async () => {
+      if (typeof page.waitForNetworkIdle === 'function') {
+        await page.waitForNetworkIdle({ idleTime: 500 }).catch(async () => {
+          if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(500)
+          else await new Promise(resolve => setTimeout(resolve, 500))
+        })
+      } else {
         if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(500)
         else await new Promise(resolve => setTimeout(resolve, 500))
-      })
-    } else {
-      if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(500)
-      else await new Promise(resolve => setTimeout(resolve, 500))
-    }
-    const image = await page.screenshot({ type: 'jpeg', quality: 90, fullPage: true })
+      }
+      return await page.screenshot({ type: 'jpeg', quality: 90, fullPage: true })
+    })(), RENDER_TIMEOUT)
     return image as Buffer
   } catch {
     return null

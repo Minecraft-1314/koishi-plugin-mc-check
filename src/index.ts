@@ -2,13 +2,13 @@ import { Context, Schema, h } from 'koishi'
 import fs from 'node:fs'
 import path from 'node:path'
 import { renderStatusCard } from './card'
+import { registerCommand } from './command'
 import { sendUpdatePush, setupUpdatePush, UPDATE_PUSH_PREFIX } from './push'
 import type { ServerAssets, ServerStatus, ServerTarget, VersionInfo } from './types'
 import { formatStatus, parseHostPort, parseTime, tcpPing } from './utils'
 
-export const inject = {
-  optional: ['database', 'puppeteer'],
-}
+export const name = 'mc-check'
+export const inject = { optional: ['database', 'puppeteer', 'http'] }
 
 interface McCheckConfig {
   debug: boolean
@@ -20,7 +20,6 @@ interface McCheckConfig {
   enableBedrockFallback: boolean
   enableCardImage: boolean
   messages: {
-    mcCheckNoServer: string
     mcCheckNoGlobal: string
     mcCheckTimeout: string
     mcUpdateNoUpdate: string
@@ -49,6 +48,7 @@ declare module 'koishi' {
 }
 
 const timePattern = /^([01]?\d|2[0-3]):([0-5]\d)$/
+const uuidPattern = /^[0-9a-f]{32}$/i
 
 export const Config: Schema<McCheckConfig> = Schema.object({
   debug: Schema.boolean().description('开启调试日志（输出全部请求与响应数据）').default(false),
@@ -60,7 +60,6 @@ export const Config: Schema<McCheckConfig> = Schema.object({
   enableBedrockFallback: Schema.boolean().description('Java 服务器离线时自动尝试 Bedrock 查询').default(true),
   enableCardImage: Schema.boolean().description('查询单个服务器时自动生成精美卡片图片（需 Puppeteer）').default(false),
   messages: Schema.object({
-    mcCheckNoServer: Schema.string().description('无服务器提示').default('请提供服务器地址'),
     mcCheckNoGlobal: Schema.string().description('无全局服务器提示').default('未配置全局服务器'),
     mcCheckTimeout: Schema.string().description('查询超时提示').default('查询超时'),
     mcUpdateNoUpdate: Schema.string().description('无更新提示').default('当前已是最新版本，暂无更新。'),
@@ -86,6 +85,10 @@ export function apply(ctx: Context, config: McCheckConfig) {
     return (ctx as any).puppeteer || (ctx as any).get?.('puppeteer')
   }
 
+  function getHttp(): any {
+    return (ctx as any).http || (ctx as any).get?.('http')
+  }
+
   function t(key: keyof McCheckConfig['messages'], ...args: any[]): string {
     let tmpl = config.messages?.[key] || key
     for (let i = 0; i < args.length; i++) {
@@ -100,21 +103,6 @@ export function apply(ctx: Context, config: McCheckConfig) {
 
   function errorMessage(error: any): string {
     return String(error?.message || error || '未知错误')
-  }
-
-  try {
-    ctx.i18n.define('zh', {
-      commands: {
-        'mc-check': { description: '查询 Minecraft 服务器状态' },
-        'mc-update': { description: '查看版本更新' },
-        'mc-skin': { description: '查看正版玩家皮肤' },
-        '接收更新推送': { description: '开启私聊或本群的版本更新推送' },
-        '关闭更新推送': { description: '关闭私聊或本群的版本更新推送' },
-        '更新推送状态': { description: '查看私聊或本群的版本更新推送状态' },
-      },
-    })
-  } catch (error) {
-    logger.warn(`注册指令文案失败：${errorMessage(error)}`)
   }
 
   ctx.inject(['database'], (databaseCtx) => {
@@ -141,7 +129,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
       : `https://api.mcsrvstat.us/3/${encodeURIComponent(query)}`
     debugLog(`[mc-check] 请求服务器状态: ${endpoint}`)
     try {
-      const http = (ctx as any).http
+      const http = getHttp()
       if (!http?.get) throw new Error('HTTP 服务不可用')
       const data = await http.get(endpoint, {
         timeout: config.requestTimeout,
@@ -179,7 +167,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
         ping,
         icon: typeof payload.icon === 'string' ? payload.icon : null,
         software: typeof payload.software === 'string' ? payload.software : (payload.software?.name || null),
-        error: null,
+        error: typeof payload.error === 'string' ? payload.error : null,
       }
     } catch (error: any) {
       debugLog(`[mc-check] 请求失败: ${errorMessage(error)}`)
@@ -218,11 +206,12 @@ export function apply(ctx: Context, config: McCheckConfig) {
     const url = `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`
     debugLog(`[mc-skin] 请求 UUID: ${url}`)
     try {
-      const http = (ctx as any).http
+      const http = getHttp()
       if (!http?.get) throw new Error('HTTP 服务不可用')
       const data = await http.get(url, { timeout: 5000 })
       if (config.debug) logger.info(`[mc-skin] UUID 响应: ${JSON.stringify(data)}`)
-      const value: string | null = data?.id || null
+      const rawValue = typeof data?.id === 'string' ? data.id : ''
+      const value: string | null = uuidPattern.test(rawValue) ? rawValue : null
       if (uuidCache.size >= UUID_MAX) {
         const first = uuidCache.keys().next().value
         if (first) uuidCache.delete(first)
@@ -240,7 +229,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
     if (!uuid) return null
     const url = `https://visage.surgeplay.com/full/512/${uuid}`
     try {
-      const http = (ctx as any).http
+      const http = getHttp()
       if (!http?.get) throw new Error('HTTP 服务不可用')
       const buffer = await http.get(url, {
         responseType: 'arraybuffer',
@@ -258,7 +247,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
 
   async function fetchVersionInfo(): Promise<VersionInfo | null> {
     try {
-      const http = (ctx as any).http
+      const http = getHttp()
       if (!http?.get) throw new Error('HTTP 服务不可用')
       const data = await http.get('https://piston-meta.mojang.com/mc/game/version_manifest.json', { timeout: 10000 })
       const { latest, versions } = data && typeof data === 'object' ? data : {}
@@ -273,20 +262,24 @@ export function apply(ctx: Context, config: McCheckConfig) {
     }
   }
 
-  async function readVersionCache(): Promise<{ releaseId: string; snapshotId: string } | null> {
+  let memoryVersionCache = { releaseId: '', snapshotId: '' }
+
+  async function readVersionCache(): Promise<{ releaseId: string; snapshotId: string }> {
     const database = getDatabase()
-    if (!database) return { releaseId: '', snapshotId: '' }
+    if (!database) return memoryVersionCache
     try {
       const rows = await database.get('mc_version_cache', { id: 1 })
-      if (rows.length) return { releaseId: rows[0].releaseId, snapshotId: rows[0].snapshotId }
+      if (rows.length) {
+        memoryVersionCache = { releaseId: rows[0].releaseId, snapshotId: rows[0].snapshotId }
+      }
     } catch (error: any) {
       debugLog(`[mc-update] 读取缓存失败: ${errorMessage(error)}`)
-      return { releaseId: '', snapshotId: '' }
     }
-    return { releaseId: '', snapshotId: '' }
+    return memoryVersionCache
   }
 
   async function writeVersionCache(info: VersionInfo): Promise<void> {
+    memoryVersionCache = { releaseId: info.release.id, snapshotId: info.snapshot.id }
     const database = getDatabase()
     if (!database) return
     try {
@@ -333,9 +326,8 @@ export function apply(ctx: Context, config: McCheckConfig) {
       .map((address) => ({ address: address.trim(), type: config.globalServerType }))
   }
 
-  try {
-    ctx.command('mc-check [address:text]', '查询 Minecraft 服务器状态')
-      .option('type', '-t <type:string>')
+  registerCommand(ctx, 'mc-check [address]', '查询 Minecraft 服务器状态', (command) => {
+    command.option('type', '-t <type:string>')
       .action(async ({ options }, address?: string) => {
       debugLog(`[mc-check] 指令触发，参数: address=${address}, type=${options?.type}`)
       if (address) {
@@ -348,14 +340,16 @@ export function apply(ctx: Context, config: McCheckConfig) {
           }
         }
         const status = await fetchWithFallback(address, requestedType)
+        const statusText = formatStatus(status, address, t('mcCheckTimeout'))
         if (config.enableCardImage) {
           const puppeteer = getPuppeteer()
-          if (puppeteer) {
-            const image = await renderStatusCard(puppeteer, status, address, assets)
-            if (image) return h.image(image, 'image/jpeg')
+          if (!puppeteer) {
+            return `${statusText}\n${t('puppeteerRequired')}`
           }
+          const image = await renderStatusCard(puppeteer, status, address, assets)
+          if (image) return h.image(image, 'image/jpeg')
         }
-        return formatStatus(status, address)
+        return statusText
       }
       const targets = getGlobalServers()
       if (!targets.length) return t('mcCheckNoGlobal')
@@ -366,32 +360,26 @@ export function apply(ctx: Context, config: McCheckConfig) {
         const batch = targets.slice(i, i + CONCURRENCY)
         const batchResults = await Promise.all(batch.map(async (target) => {
           const status = await fetchWithFallback(target.address, target.type)
-          return formatStatus(status, target.address)
+          return formatStatus(status, target.address, t('mcCheckTimeout'))
         }))
         results.push(...batchResults)
       }
       return results.join('\n\n')
       })
-  } catch (error) {
-    logger.warn(`注册 mc-check 指令失败：${errorMessage(error)}`)
-  }
+  })
 
-  try {
-    ctx.command('mc-skin <player:text>', '查看正版玩家皮肤')
-      .action(async (_argv, player?: string) => {
+  registerCommand(ctx, 'mc-skin <player>', '查看正版玩家皮肤', (command) => {
+    command.action(async (_argv, player?: string) => {
       debugLog(`[mc-skin] 查询皮肤: ${player}`)
       if (!player) return t('skinNotFound')
       const buffer = await fetchSkin(player)
       if (!buffer) return t('skinNotFound')
-      return h.image(buffer, 'image/png')
+      return [`${t('skinTitle', player)}\n`, h.image(buffer, 'image/png')]
       })
-  } catch (error) {
-    logger.warn(`注册 mc-skin 指令失败：${errorMessage(error)}`)
-  }
+  })
 
-  try {
-    ctx.command('mc-update', '查看版本更新')
-      .action(async () => {
+  registerCommand(ctx, 'mc-update', '查看版本更新', (command) => {
+    command.action(async () => {
       debugLog('[mc-update] 检查版本')
       try {
         const info = await fetchVersionInfo()
@@ -417,9 +405,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
         return `${t('mcUpdateError')}（${errorMessage(error)}）`
       }
       })
-  } catch (error) {
-    logger.warn(`注册 mc-update 指令失败：${errorMessage(error)}`)
-  }
+  })
 
   async function pushVersionUpdate(): Promise<void> {
     debugLog('[auto-update] 定时检查版本')
@@ -439,6 +425,7 @@ export function apply(ctx: Context, config: McCheckConfig) {
       const message = parts.length ? `${UPDATE_PUSH_PREFIX}\n${parts.join('\n')}` : ''
       if (!message) return
       const result = await sendUpdatePush(ctx, message)
+      if (result.fail) return
       await writeVersionCache(info)
       logger.info(`我的世界更新推送完成：成功 ${result.success}，失败 ${result.fail}`)
     } catch (error: any) {
@@ -453,9 +440,12 @@ export function apply(ctx: Context, config: McCheckConfig) {
       const target = new Date(now)
       target.setHours(hour, minute, 0, 0)
       if (target <= now) target.setDate(target.getDate() + 1)
-      ctx.setTimeout(() => {
-        pushVersionUpdate()
-        schedule()
+      ctx.setTimeout(async () => {
+        try {
+          await pushVersionUpdate()
+        } finally {
+          schedule()
+        }
       }, target.getTime() - now.getTime())
     }
     try {

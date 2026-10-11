@@ -1,9 +1,10 @@
 import { Bot, Context, Logger, Session } from 'koishi'
+import { registerCommand } from './command'
 
 export const UPDATE_PUSH_PREFIX = '我的世界更新'
 const MAX_PAGES = 20
 const MANAGER_IDS = new Set(['admin', 'administrator', 'owner', '群主', '管理员', '管理'])
-const MANAGER_NAMES = ['群主', '管理员', '管理', 'admin', 'owner', 'administrator']
+const MANAGER_NAMES = new Set(['群主', '管理员', '管理', 'admin', 'owner', 'administrator', 'manager', 'moderator'])
 const ADMIN_PERMISSION_BIT = 0x8n
 const SETTINGS_ERROR = '更新推送设置保存失败，请稍后重试'
 
@@ -23,7 +24,7 @@ function isManagerRole(role: any): boolean {
   const hasAdminPermission = typeof permissions === 'bigint'
     ? (permissions & ADMIN_PERMISSION_BIT) === ADMIN_PERMISSION_BIT
     : typeof permissions === 'number' && (permissions & Number(ADMIN_PERMISSION_BIT)) === Number(ADMIN_PERMISSION_BIT)
-  return MANAGER_NAMES.some(keyword => name.includes(keyword))
+  return MANAGER_NAMES.has(name)
     || hasAdminPermission
 }
 
@@ -94,7 +95,12 @@ async function setUserEnabled(ctx: Context, platform: string, userId: string, en
       await database.createUser(platform, userId, data)
       return true
     } catch {
-      return false
+      try {
+        await database.setUser(platform, userId, data)
+        return true
+      } catch {
+        return false
+      }
     }
   }
 }
@@ -313,19 +319,10 @@ export function setupUpdatePush(ctx: Context, logger: Logger, getDatabaseMessage
     aliases: string[],
     action: (argv: any) => Promise<string>,
   ): void {
-    try {
-      const command = ctx.command(definition, description)
-      for (const alias of aliases) {
-        try {
-          command.alias(alias)
-        } catch (error) {
-          logger.warn(`注册指令别名 ${alias} 失败：${error}`)
-        }
-      }
+    registerCommand(ctx, definition, description, (command) => {
+      for (const alias of aliases) command.alias(alias)
       command.action(action)
-    } catch (error) {
-      logger.warn(`注册指令 ${definition} 失败：${error}`)
-    }
+    })
   }
 
   register('接收更新推送', '开启当前私聊或本群的版本更新推送', [
